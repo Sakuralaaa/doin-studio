@@ -1,0 +1,63 @@
+name: Desktop validation and Windows installer
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto-cjk
+      - run: npm run check
+      - run: npm run build
+      - name: Full source regression suite
+        run: node --import tsx --test --test-concurrency=4 'src/**/*.test.ts' 'electron/**/*.test.ts' 'renderer/src/**/*.test.ts' 'renderer/src/**/*.test.tsx'
+      - name: Real API browser flows and UI screenshots
+        run: node scripts/studio-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-ui-evidence-${{ github.sha }}
+          path: artifacts/
+          retention-days: 14
+  windows:
+    needs: validate
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run package:win
+      - name: Launch the actual packaged application
+        run: node scripts/studio-electron-smoke.mjs
+      - name: Installer checksums
+        shell: pwsh
+        run: Get-ChildItem release/*.exe | Get-FileHash -Algorithm SHA256 | Format-List | Out-File artifacts/windows/SHA256.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doin-studio-windows-${{ github.sha }}
+          path: |
+            release/*.exe
+            artifacts/windows/
+          retention-days: 14

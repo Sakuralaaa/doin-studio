@@ -1,0 +1,811 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import {
+  ArrowLeft,
+  Loader2,
+  RotateCcw,
+  Trash2,
+  XCircle,
+} from 'lucide-react';
+import { Layout } from '../components/Layout';
+import { useRovingTabs } from '../components/ui/useRovingTabs';
+import { CreatePublishPackageDialog } from '../components/CreatePublishPackageDialog';
+import { CreateNotePackageDialog } from '../components/CreateNotePackageDialog';
+import { CreateToutiaoArticleDialog } from '../components/CreateToutiaoArticleDialog';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { SupplementCleanDialog } from '../components/SupplementCleanDialog';
+import { InlineNotice } from '../components/ui/InlineNotice';
+import { apiClient } from '../services/api';
+import { useOperatorStore } from '../store/operator';
+import { getCleanArtifactDecision, getCleanArtifactLoadError } from '../utils/jobArtifacts';
+import { isPublishingEligibleVideo } from '../utils/publishing';
+import { WorkflowConsole } from '../features/jobs/WorkflowConsole';
+import { ArtifactNavigator, type ArtifactKey } from '../features/jobs/artifacts/ArtifactNavigator';
+import { TranscriptArtifact } from '../features/jobs/artifacts/TranscriptArtifact';
+import { RewriteArtifact } from '../features/jobs/artifacts/RewriteArtifact';
+import { StreamingArtifact } from '../features/jobs/artifacts/StreamingArtifact';
+import { ShotArtifact } from '../features/jobs/artifacts/ShotArtifact';
+import { VideoArtifact } from '../features/jobs/artifacts/VideoArtifact';
+import { SourceVideoArtifact } from '../features/jobs/artifacts/SourceVideoArtifact';
+import { JobContextSidebar } from '../features/jobs/JobContextSidebar';
+import { StudioMonitor } from '../features/jobs/StudioMonitor';
+import { buildArtifactStates } from '../features/jobs/jobPresentation';
+import type {
+  Job,
+  CleanedScript,
+  RawTranscript,
+  PipelineStep,
+  HyperframesVideoOutput,
+  AiStreamPreview,
+  JobStepStreamEvent,
+  StreamablePipelineStep,
+} from '../types';
+
+type OutcomeTab = 'transcript' | 'script' | 'prompts' | 'video';
+
+export function JobDetailPage() {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const [job, setJob] = useState<Job | null>(null);
+  const [cleaned, setCleaned] = useState<CleanedScript | null>(null);
+  const [rawTranscript, setRawTranscript] = useState<RawTranscript | null>(null);
+  const [videoOutput, setVideoOutput] = useState<HyperframesVideoOutput | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [cleanedError, setCleanedError] = useState<string | null>(null);
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [runningStep, setRunningStep] = useState<PipelineStep | null>(null);
+  const [streamPreview, setStreamPreview] = useState<AiStreamPreview | null>(null);
+  const streamCloseRef = useRef<(() => void) | null>(null);
+  const [activeTab, setActiveTab] = useState<OutcomeTab>('script');
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [recleanOpen, setRecleanOpen] = useState(false);
+  const [recleanBusy, setRecleanBusy] = useState(false);
+  const [recleanError, setRecleanError] = useState<string | null>(null);
+
+  // ── Video player state (must be before any conditional returns) ──
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  const [streamError, setStreamError] = useState(false);
+  // 原视频（视频转录步骤下载的原片）与「原视频 | 成片」的选择。
+  // 选择为 null 表示跟随默认：有成片就看成片，否则看原视频。
+  const [rawStreamUrl, setRawStreamUrl] = useState<string | null>(null);
+  const [rawStreamError, setRawStreamError] = useState(false);
+  const [videoSide, setVideoSide] = useState<'raw' | 'final' | null>(null);
+  const [showPublishDialog, setShowPublishDialog] = useState(false);
+  // 图文包（抖音图文）与视频包是两条并列的入口：素材来源、文案口径、必填项都不同
+  const [showNoteDialog, setShowNoteDialog] = useState(false);
+  const [showToutiaoDialog, setShowToutiaoDialog] = useState(false);
+  const [showWechatDialog, setShowWechatDialog] = useState(false);
+  const [publishError, setPublishError] = useState('');
+  const currentUser = useOperatorStore((state) => state.currentUser);
+
+  const handleStreamEvent = useCallback((event: JobStepStreamEvent) => {
+    setStreamPreview((current) => ({
+      step: event.step,
+      status: event.type === 'started'
+        ? 'connecting'
+        : event.type === 'preview'
+          ? 'streaming'
+          : event.type,
+      text: event.text ?? (current?.step === event.step ? current.text : ''),
+      model: event.model ?? (current?.step === event.step ? current.model : undefined),
+      receivedLength: (event.text ?? (current?.step === event.step ? current.text : '')).length,
+      message: event.message,
+    }));
+    if (event.type === 'error' && event.message) setActionError(event.message);
+    if (['completed', 'paused', 'error'].includes(event.type)) {
+      streamCloseRef.current?.();
+      streamCloseRef.current = null;
+    }
+  }, []);
+
+  const openStepStream = useCallback(async (jobId: string, step: StreamablePipelineStep) => {
+    streamCloseRef.current?.();
+    setStreamPreview({ step, status: 'connecting', text: '', receivedLength: 0 });
+    const close = await apiClient.subscribeJobStepEvents(jobId, step, {
+      onEvent: handleStreamEvent,
+      onConnectionError: (message) => {
+        setStreamPreview((current) => current?.step === step ? { ...current, message } : current);
+      },
+    });
+    streamCloseRef.current = close;
+    return close;
+  }, [handleStreamEvent]);
+
+  useEffect(() => () => {
+    streamCloseRef.current?.();
+    streamCloseRef.current = null;
+  }, []);
+
+  const loadJobArtifacts = async (jobData: Job, isInitialLoad = false) => {
+    setCleanedError(null);
+    setTranscriptError(null);
+    setVideoError(null);
+    setVideoOutput(null);
+
+    let loadedTranscript: RawTranscript | null = null;
+    let loadedCleaned: CleanedScript | null = null;
+    let loadedVideo: HyperframesVideoOutput | null = null;
+
+    try {
+      const transcriptData = await apiClient.getJobRawTranscript(jobData.id);
+      if (transcriptData && transcriptData.transcript) {
+        setRawTranscript(transcriptData);
+        loadedTranscript = transcriptData;
+      }
+    } catch {
+      setRawTranscript(null);
+      if (jobData.steps?.transcribe?.status === 'failed') {
+        setTranscriptError('视频转录失败，可在当前步骤重试');
+      }
+    }
+
+    const cleanArtifact = getCleanArtifactDecision(jobData);
+    if (cleanArtifact.error) setCleanedError(cleanArtifact.error);
+    if (cleanArtifact.shouldLoad) {
+      try {
+        const cleanedData = await apiClient.getJobCleaned(jobData.id);
+        setCleaned(cleanedData);
+        loadedCleaned = cleanedData;
+        if (cleanedData.output?.hyperframesVideo) {
+          setVideoOutput(cleanedData.output.hyperframesVideo);
+          loadedVideo = cleanedData.output.hyperframesVideo;
+        }
+      } catch (err) {
+        setCleaned(null);
+        const status = getApiErrorStatus(err);
+        const loadError = getCleanArtifactLoadError(jobData, status, getApiErrorMessage(err));
+        if (loadError) setCleanedError(loadError);
+      }
+    } else {
+      setCleaned(null);
+    }
+
+    if (jobData.steps?.generate_video?.status === 'failed') {
+      setVideoError(jobData.steps.generate_video.lastError || '视频生成失败，可在当前步骤重试');
+    }
+
+    if (jobData.videoOutputPath || jobData.steps?.generate_video?.status === 'succeeded') {
+      try {
+        const output = await apiClient.getJobVideoOutput(jobData.id);
+        setVideoOutput(output);
+        loadedVideo = output;
+      } catch (err) {
+        setVideoOutput(null);
+        const errMsg = err instanceof Error ? err.message : '未知错误';
+        setVideoError(`视频成片加载失败: ${errMsg}`);
+      }
+    }
+
+    // Auto-select best available tab after initial load
+    if (isInitialLoad) {
+      if (loadedVideo?.videoPath) {
+        setActiveTab('video');
+      } else if (
+        loadedCleaned?.output?.shortVideoShots?.length ||
+        loadedCleaned?.output?.videoPrompts?.length ||
+        loadedCleaned?.output?.enhancedScenes?.length
+      ) {
+        setActiveTab('prompts');
+      } else if (loadedCleaned?.output?.cleanScript || loadedCleaned?.output?.summary) {
+        setActiveTab('script');
+      } else if (loadedTranscript?.transcript) {
+        setActiveTab('transcript');
+      }
+    }
+  };
+
+  useEffect(() => {
+    const fetchJob = async () => {
+      if (!id) return;
+
+      try {
+        setIsLoading(true);
+        const jobData = await apiClient.getJob(id);
+        setJob(jobData);
+        await loadJobArtifacts(jobData, true);
+      } catch (err: any) {
+        setError(err.response?.data?.message || '加载任务失败');
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchJob();
+  }, [id]);
+
+  useEffect(() => {
+    if (!id || !runningStep) return;
+    let active = true;
+    const timer = window.setInterval(async () => {
+      try {
+        const latest = await apiClient.getJob(id);
+        if (active) setJob(latest);
+      } catch {
+        // The original step request remains the source of truth for errors.
+      }
+    }, 750);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [id, runningStep]);
+
+  useEffect(() => {
+    if (!job || streamCloseRef.current) return;
+    const step = job.steps?.clean?.status === 'running'
+      ? 'clean'
+      : job.steps?.generate_video_prompts?.status === 'running'
+        ? 'generate_video_prompts'
+        : null;
+    if (!step) return;
+    void openStepStream(job.id, step);
+  }, [job?.id, job?.steps?.clean?.status, job?.steps?.generate_video_prompts?.status, openStepStream]);
+
+  useEffect(() => {
+    if (!videoOutput || !job) return;
+    setStreamError(false);
+    const loadVideoUrl = async () => {
+      try {
+        const [downloadUrl, previewUrl] = await Promise.all([
+          apiClient.downloadVideo(job.id),
+          apiClient.getVideoStreamUrl(job.id),
+        ]);
+        setVideoUrl(downloadUrl);
+        setStreamUrl(previewUrl);
+      } catch (err) {
+        console.error('Failed to get video URL:', err);
+        setStreamError(true);
+      }
+    };
+    loadVideoUrl();
+  }, [videoOutput, job?.id]);
+
+  // 原视频流地址：只要转录步骤下载过原视频（job.videoPath 有值）就解析，
+  // 与成片是否存在无关 —— 这正是「还没生成成片也能先看原视频」的关键。
+  useEffect(() => {
+    if (!job?.videoPath) {
+      setRawStreamUrl(null);
+      setRawStreamError(false);
+      return;
+    }
+    let cancelled = false;
+    setRawStreamError(false);
+    void (async () => {
+      try {
+        const url = await apiClient.getRawVideoStreamUrl(job.id);
+        if (!cancelled) setRawStreamUrl(url);
+      } catch (err) {
+        console.error('Failed to get raw video URL:', err);
+        if (!cancelled) setRawStreamError(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [job?.id, job?.videoPath]);
+
+  // 默认侧：有成片看成片（保持既有行为），否则看原视频 —— 后者让「只下载了原视频」
+  // 的任务点进视频格子就直接能看，而不是先看到「视频还没生成」。
+  const activeVideoSide: 'raw' | 'final' = videoSide ?? (videoOutput ? 'final' : 'raw');
+  // 方向键切换 + roving tabindex：整组只占一个 Tab 停靠点
+  const videoSideRoving = useRovingTabs(['raw', 'final'], activeVideoSide, (key) =>
+    setVideoSide(key as 'raw' | 'final'),
+  );
+
+  if (isLoading) {
+    return (
+      <Layout>
+        <div className="flex items-center justify-center py-24">
+          <div className="text-center">
+            <Loader2 className="mx-auto h-12 w-12 animate-spin text-accent" />
+            <p className="mt-4 text-ink-muted">正在打开作品...</p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  if (error || !job) {
+    return (
+      <Layout>
+        <div className="rounded-lg border border-line bg-panel py-20 text-center">
+          <XCircle className="mx-auto mb-4 h-12 w-12 text-danger" />
+          <h3 className="text-xl font-semibold text-ink">{error || '作品不存在'}</h3>
+          <button
+            onClick={() => navigate('/')}
+            className="mt-6 inline-flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-on-accent transition-all hover:bg-accent-hover"
+          >
+            <ArrowLeft size={16} />
+            返回创作中心
+          </button>
+        </div>
+      </Layout>
+    );
+  }
+
+  const handleDeleteJob = async () => {
+    try {
+      setActionError(null);
+      await apiClient.deleteJob(job.id);
+      navigate('/');
+    } catch (err: any) {
+      setActionError(err.response?.data?.message || '删除作品失败');
+    }
+  };
+
+  const handleRestoreJob = async () => {
+    try {
+      setActionError(null);
+      const restored = await apiClient.restoreJob(job.id);
+      setJob(restored);
+    } catch (err: any) {
+      setActionError(err.response?.data?.message || '恢复作品失败');
+    }
+  };
+
+  const handleRunStep = async (step: PipelineStep) => {
+    let closeStream: (() => void) | null = null;
+    try {
+      setActionError(null);
+      if (step === 'clean' || step === 'generate_video_prompts') {
+        setActiveTab(step === 'clean' ? 'script' : 'prompts');
+        closeStream = await openStepStream(job.id, step);
+      } else {
+        setStreamPreview(null);
+      }
+      setRunningStep(step);
+      const updated = await apiClient.runJobStep(job.id, step);
+      setJob(updated);
+      await loadJobArtifacts(updated);
+      setStreamPreview(null);
+    } catch (err: any) {
+      const responseJob = err.response?.data?.job as Job | undefined;
+      if (responseJob) {
+        setJob(responseJob);
+        await loadJobArtifacts(responseJob);
+      }
+      setActionError(err.response?.data?.message || '步骤执行失败');
+    } finally {
+      closeStream?.();
+      if (streamCloseRef.current === closeStream) streamCloseRef.current = null;
+      setRunningStep(null);
+    }
+  };
+
+  const handlePauseStep = async () => {
+    try {
+      setActionError(null);
+      const updated = await apiClient.pauseJobStep(job.id);
+      setJob(updated);
+      streamCloseRef.current?.();
+      streamCloseRef.current = null;
+      setStreamPreview((current) => current ? {
+        ...current,
+        status: 'paused',
+        message: '已暂停，可重新执行当前步骤',
+      } : current);
+      setRunningStep(null);
+    } catch (err: any) {
+      const responseJob = err.response?.data?.job as Job | undefined;
+      if (responseJob) setJob(responseJob);
+      setActionError(err.response?.data?.message || '暂停步骤失败');
+    }
+  };
+
+  const handleReclean = async (supplementalText: string) => {
+    let closeStream: (() => void) | null = null;
+    setRecleanBusy(true);
+    setRecleanError(null);
+    setActionError(null);
+    try {
+      setActiveTab('script');
+      closeStream = await openStepStream(job.id, 'clean');
+      setRunningStep('clean');
+      const updated = await apiClient.recleanJob(job.id, supplementalText);
+      setJob(updated);
+      await loadJobArtifacts(updated);
+      setStreamPreview(null);
+      setRecleanOpen(false);
+    } catch (err: any) {
+      const responseJob = err.response?.data?.job as Job | undefined;
+      if (responseJob) {
+        setJob(responseJob);
+        await loadJobArtifacts(responseJob);
+      }
+      setRecleanError(err.response?.data?.message || '补充洗稿失败');
+    } finally {
+      closeStream?.();
+      if (streamCloseRef.current === closeStream) streamCloseRef.current = null;
+      setRunningStep(null);
+      setRecleanBusy(false);
+    }
+  };
+
+  const artifactAvailability = {
+    transcriptReady: Boolean(rawTranscript?.transcript),
+    rewriteReady: Boolean(cleaned?.output?.cleanScript || cleaned?.output?.summary),
+    shotsReady: Boolean(cleaned?.output?.shortVideoShots?.length || cleaned?.output?.videoPrompts?.length || cleaned?.output?.enhancedScenes?.length),
+    videoReady: Boolean(videoOutput?.videoPath),
+    transcriptError,
+    rewriteError: cleanedError,
+    videoError: videoError && !videoOutput ? videoError : null,
+  };
+  const artifactStates = buildArtifactStates(job, artifactAvailability);
+  const activeArtifactKey: ArtifactKey = activeTab === 'prompts' ? 'shots' : activeTab === 'script' ? 'script' : activeTab === 'transcript' ? 'transcript' : 'video';
+
+  const openPublishingDialog = () => {
+    if (!currentUser) {
+      setPublishError('本机操作者未就绪，请重试');
+      return;
+    }
+    setPublishError('');
+    setShowPublishDialog(true);
+  };
+
+  const openNotePublishingDialog = () => {
+    if (!currentUser) {
+      setPublishError('本机操作者未就绪，请重试');
+      return;
+    }
+    setPublishError('');
+    setShowNoteDialog(true);
+  };
+
+  const openToutiaoPublishingDialog = () => {
+    if (!currentUser) {
+      setPublishError('本机操作者未就绪，请重试');
+      return;
+    }
+    setPublishError('');
+    setShowToutiaoDialog(true);
+  };
+
+  return (
+    <Layout>
+      {/* Title bar */}
+      <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => navigate('/')}
+            className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-line text-ink-muted transition-colors hover:bg-panel hover:text-ink"
+            aria-label="返回创作中心"
+          >
+            <ArrowLeft size={18} />
+          </button>
+          <div>
+            <h1 className="font-display text-2xl font-semibold text-ink">{cleaned?.output?.title || job.topic || '未命名作品'}</h1>
+            <p className="mt-1 text-sm text-ink-muted">更新于 {new Date(job.updatedAt).toLocaleString('zh-CN')}</p>
+          </div>
+        </div>
+        {job.deletedAt ? (
+          <button
+            onClick={handleRestoreJob}
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2.5 font-medium text-on-accent transition-all hover:bg-accent-hover"
+          >
+            <RotateCcw size={16} />
+            恢复作品
+          </button>
+        ) : (
+          <button
+            onClick={() => setDeleteConfirmOpen(true)}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-danger-line px-4 py-2.5 font-medium text-danger transition-all hover:bg-danger-soft"
+          >
+            <Trash2 size={16} />
+            删除作品
+          </button>
+        )}
+      </div>
+
+      {/* Trashed notice */}
+      {job.deletedAt && (
+        <div className="mb-6">
+          <InlineNotice tone="warning" title="此作品已在垃圾桶中">
+            {formatTrashRetention(job.trashExpiresAt)}
+          </InlineNotice>
+        </div>
+      )}
+
+      {/* Workflow console */}
+      <WorkflowConsole
+        job={job}
+        runningStep={runningStep}
+        actionError={actionError}
+        onRunStep={handleRunStep}
+        onPauseStep={handlePauseStep}
+        onReClean={() => {
+          setRecleanError(null);
+          setRecleanOpen(true);
+        }}
+      />
+
+      {/* Outcome tabs */}
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[minmax(280px,0.8fr)_minmax(0,1.2fr)]">
+        <div className="min-w-0 space-y-5">
+          <StudioMonitor rawUrl={rawStreamUrl} finalUrl={streamUrl} downloadUrl={videoUrl} />
+          <JobContextSidebar job={job} />
+        </div>
+        <div className="overflow-hidden rounded-lg border border-line bg-panel">
+          <ArtifactNavigator
+            active={activeArtifactKey}
+            items={artifactStates.map((a) => ({ key: a.key as ArtifactKey, label: a.label, state: a.state }))}
+            onChange={(key) => {
+              if (key === 'shots') setActiveTab('prompts');
+              else if (key === 'script') setActiveTab('script');
+              else if (key === 'transcript') setActiveTab('transcript');
+              else setActiveTab('video');
+            }}
+          />
+          <div className="p-6">
+            {activeArtifactKey === 'transcript' && (
+              <TranscriptArtifact
+                transcript={rawTranscript}
+                fallbackText={cleaned?.output?.rawText}
+                transcriptError={transcriptError}
+              />
+            )}
+            {activeArtifactKey === 'script' && (
+              <>
+                {job.steps?.clean?.status === 'succeeded' && (
+                  <div className="mb-4 flex flex-col gap-3 rounded-lg border border-line bg-elevated p-4 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="text-sm text-ink-muted">洗稿结果已生成。若转录遗漏了关键信息，可补充内容后让 AI 结合转录重新洗稿。</p>
+                    <button
+                      onClick={() => {
+                        setRecleanError(null);
+                        setRecleanOpen(true);
+                      }}
+                      className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-accent-line px-4 py-2 text-sm font-medium text-accent transition-all hover:bg-accent hover:text-on-accent"
+                    >
+                      补充内容重新洗稿
+                    </button>
+                  </div>
+                )}
+                {recleanError && (
+                  <div className="mb-4 rounded-lg border border-danger-line bg-danger-soft p-4 text-sm text-danger">{recleanError}</div>
+                )}
+                <RewriteArtifact
+                  cleaned={cleaned}
+                  cleanedError={cleanedError}
+                  streamPreview={streamPreview?.step === 'clean' ? streamPreview : null}
+                />
+              </>
+            )}
+            {activeArtifactKey === 'shots' && (
+              <ShotsContent
+                cleaned={cleaned}
+                streamPreview={streamPreview?.step === 'generate_video_prompts' ? streamPreview : null}
+              />
+            )}
+            {activeArtifactKey === 'video' && (
+              <>
+                <div
+                  role="tablist"
+                  aria-label="视频来源"
+                  onKeyDown={videoSideRoving.onKeyDown}
+                  className="mb-5 inline-flex rounded-lg border border-line bg-elevated p-1"
+                >
+                  {([
+                    { key: 'raw' as const, label: '原视频' },
+                    { key: 'final' as const, label: '成片' },
+                  ]).map((side) => {
+                    const selected = activeVideoSide === side.key;
+                    return (
+                      <button
+                        key={side.key}
+                        type="button"
+                        role="tab"
+                        aria-selected={selected}
+                        tabIndex={videoSideRoving.tabIndexFor(side.key)}
+                        ref={(node) => { videoSideRoving.refs.current[side.key] = node; }}
+                        onClick={() => setVideoSide(side.key)}
+                        className={`rounded-md px-4 py-1.5 text-sm font-medium transition-all ${
+                          selected
+                            ? 'bg-panel text-ink shadow-sm'
+                            : 'text-ink-muted hover:text-ink'
+                        }`}
+                      >
+                        {side.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                {activeVideoSide === 'raw' ? (
+                  <SourceVideoArtifact
+                    jobId={job.id}
+                    videoPath={job.videoPath}
+                    streamUrl={rawStreamUrl}
+                    streamError={rawStreamError}
+                    onVideoError={() => setRawStreamError(true)}
+                  />
+                ) : videoOutput ? (
+                  <VideoArtifact
+                    output={videoOutput}
+                    jobId={job.id}
+                    title={cleaned?.output?.title || job.topic || '未命名作品'}
+                    videoError={videoError}
+                    videoUrl={videoUrl}
+                    streamUrl={streamUrl}
+                    streamError={streamError}
+                    publishError={publishError}
+                    onOpenPublishing={openPublishingDialog}
+                    onOpenNotePublishing={openNotePublishingDialog}
+                    onOpenToutiaoPublishing={openToutiaoPublishingDialog}
+                    onOpenWechatPublishing={() => setShowWechatDialog(true)}
+                    onVideoError={() => setStreamError(true)}
+                  />
+                ) : videoError ? (
+                  <div className="rounded-lg border border-danger-line bg-danger-soft p-4 text-danger">
+                    <p className="font-semibold">视频成片不可用</p>
+                    <p className="mt-1 text-sm">{videoError}</p>
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-dashed border-line bg-elevated py-14 text-center">
+                    <h3 className="font-semibold text-ink">视频还没生成</h3>
+                    <p className="mt-2 text-sm text-ink-muted">完成生成分镜后，可以执行生成视频步骤，渲染 9:16 竖屏 MP4。</p>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+
+      </div>
+
+      {showPublishDialog && videoOutput && isPublishingEligibleVideo(videoOutput) && (
+        <CreatePublishPackageDialog
+          jobId={job.id}
+          title={cleaned?.output?.title || job.topic || '未命名作品'}
+          output={videoOutput}
+          onClose={() => setShowPublishDialog(false)}
+        />
+      )}
+
+      {showNoteDialog && videoOutput && isPublishingEligibleVideo(videoOutput) && (
+        <CreateNotePackageDialog
+          jobId={job.id}
+          title={cleaned?.output?.title || job.topic || '未命名作品'}
+          onClose={() => setShowNoteDialog(false)}
+        />
+      )}
+
+      {(showToutiaoDialog || showWechatDialog) && videoOutput && isPublishingEligibleVideo(videoOutput) && (
+        <CreateToutiaoArticleDialog
+          platform={showWechatDialog ? 'wechat_mp' : 'toutiao'}
+          jobId={job.id}
+          title={cleaned?.output?.title || job.topic || '未命名作品'}
+          onClose={() => { setShowToutiaoDialog(false); setShowWechatDialog(false); }}
+        />
+      )}
+
+      <ConfirmDialog
+        open={deleteConfirmOpen}
+        title="确定删除这个作品吗？"
+        description="删除后会进入垃圾桶，30 天内可恢复。"
+        confirmLabel="删除"
+        onConfirm={handleDeleteJob}
+        onClose={() => setDeleteConfirmOpen(false)}
+      />
+
+      <SupplementCleanDialog
+        open={recleanOpen}
+        busy={recleanBusy}
+        error={recleanError}
+        onConfirm={handleReclean}
+        onClose={() => setRecleanOpen(false)}
+      />
+    </Layout>
+  );
+}
+
+// ── Shots display content (delegates to ShotArtifact) ──
+
+function ShotsContent({ cleaned, streamPreview }: { cleaned: CleanedScript | null; streamPreview?: AiStreamPreview | null }) {
+  const output = cleaned?.output;
+  const shots = output?.shortVideoShots ?? [];
+  const prompts = output?.videoPrompts ?? [];
+  const scenes = output?.enhancedScenes ?? [];
+
+  if (!shots.length && !prompts.length && !scenes.length && !streamPreview) {
+    return (
+      <div className="rounded-lg border border-dashed border-line bg-elevated py-14 text-center">
+        <h3 className="font-semibold text-ink">镜头列表还没生成</h3>
+        <p className="mt-2 text-sm text-ink-muted">完成生成分镜后，这里会显示 HyperFrames 使用的短视频镜头规划。</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      {streamPreview && <StreamingArtifact kind="shots" preview={streamPreview} />}
+      <div>
+        <h3 className="text-lg font-semibold text-ink">镜头列表</h3>
+        <p className="mt-1 text-sm text-ink-muted">基于 AI 洗稿结果生成的短视频镜头、字幕、动效节奏和视觉层级。</p>
+      </div>
+
+      {shots.length > 0 ? (
+        <div className="space-y-3">
+          {shots.map((shot) => (
+            <ShotArtifact key={`${shot.index}-${shot.caption || shot.headline || ''}`} shot={shot} />
+          ))}
+        </div>
+      ) : scenes.length > 0 ? (
+        <div className="space-y-3">
+          {scenes.map((scene) => (
+            <div key={scene.scene} className="rounded-lg border border-line bg-elevated p-4">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <p className="font-semibold text-ink">场景 {scene.scene}</p>
+                {scene.cameraMovement && (
+                  <span className="rounded-full bg-panel px-2 py-1 text-xs text-ink-muted">{scene.cameraMovement}</span>
+                )}
+              </div>
+              <p className="text-sm leading-6 text-ink">{scene.videoPrompt}</p>
+              <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
+                {scene.originalVisual && <Metric label="画面" value={scene.originalVisual} />}
+                {scene.motionEffect && <Metric label="动效" value={scene.motionEffect} />}
+                {scene.lightingStyle && <Metric label="光影" value={scene.lightingStyle} />}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {prompts.map((prompt, index) => (
+            <p key={index} className="rounded-lg border border-line bg-elevated p-4 text-sm leading-6 text-ink">
+              {index + 1}. {prompt}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {output?.videoOutline && output.videoOutline.length > 0 && (
+        <div>
+          <h4 className="mb-3 text-base font-semibold text-ink">兼容视频大纲</h4>
+          <div className="space-y-3">
+            {output.videoOutline.map((item, index) => (
+              <div key={index} className="rounded-lg border border-line bg-elevated p-4">
+                <p className="mb-2 font-semibold text-ink">{index + 1}. {item.title}</p>
+                <ul className="list-disc space-y-1 pl-5 text-sm text-ink">
+                  {item.bullets.map((bullet, bulletIndex) => (
+                    <li key={bulletIndex}>{bullet}</li>
+                  ))}
+                </ul>
+                {item.visualPrompt && <p className="mt-3 text-sm text-ink-muted">{item.visualPrompt}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Utility helpers ──
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-elevated px-4 py-3">
+      <label className="mb-1 block text-xs text-ink-muted">{label}</label>
+      <p className="text-sm text-ink">{value}</p>
+    </div>
+  );
+}
+
+function formatTrashRetention(value?: string) {
+  if (!value) return '保留期未知';
+  const days = Math.ceil((new Date(value).getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+  if (days <= 0) return '即将自动清理';
+  return `剩余 ${days} 天自动清理`;
+}
+
+function getApiErrorStatus(error: unknown) {
+  return (error as { response?: { status?: number } })?.response?.status;
+}
+
+function getApiErrorMessage(error: unknown) {
+  const responseMessage = (error as { response?: { data?: { message?: string } } })?.response?.data?.message;
+  if (responseMessage) return responseMessage;
+  return error instanceof Error ? error.message : '未知错误';
+}

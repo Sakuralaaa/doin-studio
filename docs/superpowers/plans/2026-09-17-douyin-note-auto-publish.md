@@ -1,0 +1,361 @@
+# 抖音图文自动发布 实施计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** 在发布中心为图文交付包提供「发布图文到抖音」动作：调用外部 `sau` CLI 提交，处理短信验证码，把结果记为「已提交」，最终由人点现有「标记已发布」确认。
+
+**Architecture:** 复用现有交付包与发布中心（版本/排期/审计/垃圾桶全部白拿），只给 `DeliveryPackage` 加 `contentType` 与图文素材/文案字段，并在 `PublishTask` 上挂 `autoPublish` 子记录表达机器动作 —— **不动 `PublishTaskStatus` 状态机**。新增 `sau-runner.ts` 封装外部 CLI，与既有 yt-dlp / whisper-cli / hyperframes 同模式；图文素材直接用应用已产出的场景静帧。
+
+**Tech Stack:** Node.js + Express 4 + TypeScript（后端子进程调用）、React 19 + Tailwind CSS（发布中心 UI）、Node 内置 test runner（`node --import tsx --test`）。
+
+**Spec:** `docs/superpowers/specs/2026-09-17-douyin-note-auto-publish-design.md`
+
+## Global Constraints
+
+- **不新增 `PublishTaskStatus` 取值**；`PublishingListStatus`（含 `"broken"`）与既有 filter 语义保持不变。
+- `contentType` 缺省视为 `"video"`，存量包与既有用例必须零改动地继续通过。
+- 图文文案走独立 `noteCopy`，校验口径独立：douyin 图文 **title ≤20 / note ≤1000 / hashtags ≤10**；现有 `PUBLISH_PLATFORMS.douyin.titleMax = 55` 是视频口径，不得改动。
+- 图文素材取 `output/videos/{jobId}/hyperframes/snapshots/frame-*.png` 按场景序；打包时**复制进包目录**，保持包自包含（与视频/封面一致）。
+- CLI 退出码 0 只记为 `succeeded`（**已提交**），绝不写 `published`。
+- **失败绝不自动重试**；同一任务同时只允许一个 `autoPublish` 运行（冲突返回 409）。
+- **`auto-publish` 必须携带 `previewRevision`**：缺失 → 400，与当前内容不一致 → 409，两种情况都**不得产生 `autoPublish` 记录**。「发布前必经预览」因此是服务端约束，顺带拦住"预览之后内容被改"。校验实现在 Task 4（该路由的归属），产出 revision 的预览接口在 Task 5。
+- 测试**必须全部使用假 CLI**（临时目录里的 stub 脚本），不得联网、不得调用真实抖音；本计划不包含任何真实发布步骤。
+- 未配置 `sauBinary` 时必须给出明确错误（含 spec §1.2 的三个安装坑），不得静默失败。
+- 后端改动需 `npm run build:backend` 并重启才生效。
+
+### Task 1: 类型、图文校验口径与图片清单哈希（测试先行）
+
+**Files:**
+- Modify: `src/types.ts`
+- Modify: `src/lib/publishing-platforms.ts`
+- Test: `src/lib/publishing-platforms.test.ts`
+
+**Interfaces:**
+- Consumes: 现有 `PlatformCopy`、`validatePlatformCopy`
+- Produces: `PublishNotePolicy` + `PUBLISH_NOTE_POLICIES`、`validateNoteCopy(copy): PlatformCopyValidationError[]`、`DeliveryPackage.contentType/imagePaths/noteCopy`、`PublishTask.autoPublish`、`PublishAssetHealth` 增 `missing_images`
+
+- [x] **Step 1: 写失败用例**
+
+- douyin 图文 title 21 字 → 报错且 message 指出 20 字上限；20 字 → 通过。
+- note 1001 字 → 报错；1000 字 → 通过。
+- hashtags 超过 10 个 → 报错（沿用既有 hashtag 规则）。
+- 视频口径未受影响：`validatePlatformCopy("douyin", …)` 对 55 字标题仍通过（回归断言）。
+
+- [x] **Step 2: 运行确认失败**
+
+Run: `node --import tsx --test src/lib/publishing-platforms.test.ts`
+Expected: FAIL —— `validateNoteCopy` 不存在。
+
+- [x] **Step 3: 实现类型与校验**
+
+`PUBLISH_NOTE_POLICIES` 只为 douyin 定义图文口径（结构化 `Record<PublishPlatform, PlatformPolicy>` 可先仅含 douyin，其余平台待后续接入时补）。`validateNoteCopy` 复用 `normalizePlatformCopy` 与既有错误形状，仅替换上限来源。
+
+- [x] **Step 4: 运行确认通过，并跑既有 publishing 用例作为回归**
+
+Run: `node --import tsx --test src/lib/publishing-platforms.test.ts src/lib/publishing-store.test.ts`
+Expected: PASS。
+
+### Task 2: 图文打包（测试先行）
+
+**Files:**
+- Modify: `src/lib/publishing-assets.ts`
+- Test: `src/lib/publishing-assets.test.ts`
+
+**Interfaces:**
+- Consumes: Task 1 的类型、`hyperframes/snapshots/frame-*.png`、既有打包/校验流程（`clone`/`copy`、`assetHealth`、sha256 校验）
+- Produces: 图文包的 `imagePaths`（包内 `images/NN.png`）、图片清单哈希、`missing_images` 健康值
+
+- [x] **Step 1: 写失败用例**
+
+在临时 job 目录造 `snapshots/frame-00-at-3s.png`、`frame-01-at-9s.png`（用最小 PNG 字节），断言：
+
+- 打包后包目录里按**场景序**出现 `images/01.png`、`images/02.png`（不是字典序错乱）。
+- 包记录含 `contentType: "note"` 与有序 `imagePaths`。
+- 图片清单哈希 = 各图 sha256 有序拼接后再哈希；**改动任一张图或调换顺序都会改变哈希**（两个断言）。
+- 缺失 `snapshots/` 或一张图都没有时 → `assetHealth === "missing_images"`，且打包报明确错误。
+- **存量兼容**：不传图文参数时 `contentType` 为 `"video"`，视频包行为与哈希逐字节不变。
+
+- [x] **Step 2: 运行确认失败**
+
+Run: `node --import tsx --test src/lib/publishing-assets.test.ts`
+Expected: FAIL —— 图文打包分支不存在。
+
+- [x] **Step 3: 实现**
+
+按场景序收集静帧 → 复制进 `images/` → 计算清单哈希 → 落库；`assetHealth` 判定在 `contentType === "note"` 时走图片分支，视频分支保持原样。
+
+- [x] **Step 4: 运行确认通过**
+
+Run: `node --import tsx --test src/lib/publishing-assets.test.ts`
+Expected: PASS，且既有视频打包用例全部保持通过。
+
+### Task 3: `sau-runner.ts`（测试先行，全程假 CLI）
+
+**Files:**
+- Create: `src/lib/sau-runner.ts`
+- Test: `src/lib/sau-runner.test.ts`
+
+**Interfaces:**
+- Consumes: `runCommand`（既有）、`sauBinary` / `sauBaseDir` 配置、我们的 cookie 文件
+- Produces: `checkLogin()`、`prepareAccountFile()`、`runUploadNote()`、`syncBackCookies()`；结果形状 `{ ok: boolean; exitCode: number; output: string; needsVerificationCode: boolean }`
+
+- [x] **Step 1: 写失败用例（用 stub 脚本，绝不联网）**
+
+测试夹具在临时目录写入 shell stub 并 `chmod +x`，通过 `sauBinary` 注入：
+
+- stub 打印 `valid` 退出 0 → `checkLogin()` 返回 ok。
+- stub 打印 `invalid` 退出 1 → ok=false。
+- 未配置 `sauBinary` → 抛明确错误（消息含"未配置"）。
+- `prepareAccountFile()`：读我们的 Cookie 头文件 → 产出 `<sauBaseDir>/cookies/douyin_<name>.json`，断言是 `storage_state` 形状（`cookies[].domain === ".douyin.com"`、含 `sessionid`），**断言文件权限为 600**。
+- `syncBackCookies()`：给定一份被改写的 `storage_state` → 我们的 cookie 文件被更新为新的 Cookie 头，且格式仍是 `name=value; …`（往返一致：prepare→syncBack 后内容语义等价）。
+- `runUploadNote()`：stub 输出含验证码提示关键字 → `needsVerificationCode === true`；stub 退出 0 → ok=true；退出 1 → ok=false 且 output 被保留。
+- 命令拼装：断言传给 stub 的参数里图片数量、`--title`、`--note`、`--tags` 正确（stub 把自己的 argv 写进文件供断言）。
+
+- [x] **Step 2: 运行确认失败**
+
+Run: `node --import tsx --test src/lib/sau-runner.test.ts`
+Expected: FAIL —— 模块不存在。
+
+- [x] **Step 3: 实现 runner**
+
+用既有 `runCommand` 调子进程（与 whisper/yt-dlp 同一套封装），`timeoutMs` 给足（上传是分钟级）；cookie 双向转换实现为纯函数 + 读写分离，便于单测。
+
+- [x] **Step 4: 运行确认通过**
+
+Run: `node --import tsx --test src/lib/sau-runner.test.ts`
+Expected: PASS。
+
+### Task 4: 路由、并发互斥与验证码通路（测试先行）
+
+**Files:**
+- Modify: `src/lib/publishing-routes.ts`（薄路由）
+- Modify: `src/lib/publishing-store.ts`（包级 revision、autoPublish 原子读写、互斥）
+- Modify: `src/lib/publishing-service.ts`（编排：预检 → 凭据 → 执行 → 回写；**计划外新增**，见下）
+- Modify: `src/lib/publishing-assets.ts`（`resolvePackageImages`）、`src/lib/sau-runner.ts`（`assertConfigured`）
+- Modify: `src/app.ts`（`sauRunner` / `sauBinary` / `sauBaseDir` 注入）
+- Test: `src/app.test.ts`、`src/lib/publishing-store.test.ts`
+
+> **执行说明（2026-09-17）**：编排没有写进路由处理器，而是放在 `PublishingService` ——
+> 本项目所有路由都是「校验 + 转调 service」的薄层，把编排塞进路由会破坏这条既有架构不变式。
+> 因此文件清单比原计划多 3 个文件。另外新增了一条计划外的安全阀：遗留 `running` 记录超过
+> 30 分钟即视为进程已死，否则同步请求被杀后会永久锁死任务（见 spec §8）。
+
+**Interfaces:**
+- Consumes: Task 3 的 runner、Task 2 的图文包
+- Produces: `POST /api/publishing/tasks/:id/auto-publish`（**要求 body 带 `previewRevision`**）、`POST /api/publishing/tasks/:id/auto-publish/code`；任务上的 `autoPublish` 记录；store 的包级 `previewRevision` 计算与比对
+
+- [x] **Step 1: 写失败用例**
+
+- 对非图文包（`contentType` 缺省 video）调用 → 400/422 明确错误。
+- **不带 `previewRevision` → 400**，且任务状态与 `autoPublish` 均不被写入。
+- **带过期 `previewRevision`（预览后改过文案）→ 409**，同样不写入。
+- 未配置 `sauBinary` → 明确错误，且**任务状态与 `autoPublish` 均不被写入**。
+- 运行中再次调用 → **409**，且不产生第二条 `autoPublish`。
+- 预检 `invalid` → `autoPublish.status === "failed"`，任务**仍为 `ready`**（绝不写 `published`）。
+- 需要验证码 → `autoPublish.status === "awaiting_code"`；提交验证码接口把内容写入 `<sauBaseDir>/verify_code.txt`。
+- 成功（退出 0）→ `autoPublish.status === "succeeded"`，任务状态**仍不是 `published`**（这是本设计最关键的一条断言）。
+
+- [x] **Step 2: 运行确认失败**
+
+Run: `node --import tsx --test src/app.test.ts src/lib/publishing-store.test.ts`
+Expected: FAIL —— 路由不存在。
+
+- [x] **Step 3: 实现路由与 store**
+
+互斥用 store 内的运行标记（与既有"运行中重复触发 409"语义一致）；`autoPublish` 读写走既有原子写路径；错误经既有 `route()` 通道。
+
+- [x] **Step 4: 运行确认通过**
+
+Run: `node --import tsx --test src/app.test.ts src/lib/publishing-store.test.ts`
+Expected: PASS。
+
+### Task 5: 发布前预览（弹窗 + 服务端必经确认）（测试先行）
+
+**Files:**
+- Modify: `src/lib/publishing-routes.ts`、`src/types.ts`
+- Modify: `src/lib/publishing-service.ts`（`packagePreview` / `readPackageImage`；与 Task 4 同理，编排留在 service）
+- Modify: `src/lib/publishing-assets.ts`（`readPackageImage`，复用 `resolveDeclaredImage` 这一份归属校验）
+- Modify: `renderer/src/types/index.ts`（补 `PackageContentType` / `missing_images` / `imagePaths` / `noteCopy`）
+- Create: `renderer/src/components/PublishPreviewDialog.tsx`
+- Test: `src/app.test.ts`、`renderer/src/components/PublishPreviewDialog.test.tsx`
+
+> **执行说明（2026-09-17）**：① 文件清单比计划多 3 个（理由同 Task 4：薄路由 + service 编排）；
+> ② **文案校验留在服务端**：渲染层是独立 TS 工程（`tsconfig.renderer.json` 只 include
+> `renderer/src`），引用不到 `src/lib` 的 `validateNoteCopy`。因此预览接口直接下发
+> `copyChecks`（每字段 `actual/limit/over` + `violations`），弹窗只渲染 —— 否则渲染层会
+> 出现第二份长度规则并与后端漂移；③ 图文包的文案区显示**包级 `noteCopy`**（= auto-publish
+> 实际提交的内容），不是任务文案，避免「看到的」与「发出去的」不一致。
+
+**Interfaces:**
+- Consumes: 既有 `GET /api/publishing/packages/:id/cover` 的模式、Task 1 的 `validateNoteCopy`、Task 4 已实现的 `previewRevision` 比对
+- Produces: `GET /api/publishing/packages/:id/preview`（**产出** `previewRevision`）、`GET /api/publishing/packages/:id/images/:index`
+
+- [x] **Step 1: 写失败用例**
+
+- 视频包预览返回视频元数据 + 各平台文案 + `previewRevision`；图文包返回**有序** `imagePaths` + `noteCopy`。
+- `GET .../images/:index`：序号与 `imagePaths` 一一对应；越界或缺图 → 404。
+- **两个接口产出的 `previewRevision` 必须能被 Task 4 的校验接受**（端到端串起来：先预览取 revision，再带它提交）。
+
+- [x] **Step 2: 运行确认失败**
+
+Run: `node --import tsx --test src/app.test.ts`
+Expected: FAIL —— 预览接口不存在。
+
+- [x] **Step 3: 实现服务端**
+
+包级 `previewRevision` 是内容指纹：图文包覆盖 `imagePaths`（含顺序）与 `noteCopy`；视频包覆盖视频哈希与各平台文案。沿用既有 `PublishingPreview.previewRevision` 的语义，不新造一套。
+
+- [x] **Step 4: 写失败用例（组件）**
+
+`renderToStaticMarkup`：视频包渲染 `<video`；图文包渲染 N 张图与 `1/N` 序号；超限文案标红并显示上限。
+
+- [x] **Step 5: 实现弹窗组件**
+
+按 `contentType` 分支渲染；文案区显示字数/上限并复用 `validateNoteCopy` 判定超限；公共区显示版本、包路径、创建人/时间与 `assetHealth`（缺失资产必须显眼）。
+
+- [x] **Step 6: 运行确认通过**
+
+Run: `node --import tsx --test src/app.test.ts renderer/src/components/PublishPreviewDialog.test.tsx && npm run check`
+Expected: PASS，且既有 publishing 用例全部保持通过。
+
+### Task 5.5: 图文包创建入口（**计划外补齐**，2026-09-17）
+
+> 计划漏了一步：Task 2 做出来的 `createNotePackageAssets` **没有任何调用方**，所以图文包根本无法
+> 创建。Task 4/5 的服务端用例都是把图文包**直接种进索引**来测的，接口本身是对的，但真实应用里
+> 造不出图文包 —— Task 6 的界面能写，Task 7 的人工复核走不通。故补这一步。
+
+**Files:**
+- Modify: `src/types.ts`（`PublishingPreview` 增 `contentType`/`images`/`noteCopy`/`noteCopyTitleCompressed`；`CreatePublishingPackageInput` 增 `contentType`/`noteCopy`）
+- Modify: `src/lib/publishing-service.ts`（`previewNotePackage` / `createNote` / `createNotePackage` / `commitNewPackage`；`sourceRevision` 支持图片集合）
+- Modify: `src/lib/publishing-routes.ts`（预览与创建接受 `contentType`，图文只认包级 `noteCopy`）
+- Test: `src/app.test.ts`
+
+- [x] **Step 1: 写失败用例** —— 图文预览列出场景静帧 + 压缩后的 `noteCopy`；创建图文包记录图文元数据；超 20 字文案 422；非抖音平台 422；过期 revision 409；**创建→预览→提交 端到端**。
+- [x] **Step 2: 运行确认失败**（6/6 失败，路由与分支都不存在）
+- [x] **Step 3: 实现**
+
+关键实现决定：
+
+- **`sourceRevision` 只在图文时把图片集合纳入指纹**（`image:<name>` 段按场景序）。视频路径不传该参数，
+  因此既有精确哈希断言（`publishing-service.test.ts` 的 `previewRevision, expected`）逐字节不变 —— 这条断言就是本次重构的回归门禁。
+- **抽出 `commitNewPackage`**（预留版本 → 建任务 → 打包 → 落库 → 失败回滚）：视频与图文只在 `build` 上不同。
+  这段编排里的回滚与一致性错误处理很微妙（漏一次 rollback 就留下孤儿包目录），所以只留一份实现，
+  与 assets 层「安全校验只允许有一个真源」同一原则。
+- **图文只认包级 `noteCopy`**：平台任务的文案由服务端从它同步生成，避免客户端同时传两份后互相漂移
+  （否则会出现「预览看到一份、发出去另一份」，正是 spec §14.3 要防的）。
+- **note 包的 `video*` 字段**用图片清单哈希 / 图片总字节 / `copy` 诚实填充（spec §5 说「不适用」，但字段是必填，留空不如如实记录）。
+- 图文目前**只支持抖音**（上游只有 `sau douyin upload-note`），其余平台返回 422 明确错误。
+
+- [x] **Step 4: 运行确认通过** —— 6/6 绿；全量 462 → **468**，仅剩既有失败。
+
+### Task 6: 发布中心 UI 与配置透传
+
+**Files:**
+- Modify: `renderer/src/pages/PublishingPage.tsx`
+- Modify: `renderer/src/utils/publishing.ts`
+- Modify: `renderer/src/services/api.ts`、`renderer/src/types/index.ts`
+- Modify: `src/app.ts`（Task 4 已接好 `sauBinary`/`sauBaseDir`/`sauRunner`）、`src/server.ts`、`electron/server.ts`（env 透传）
+- Test: `renderer/src/utils/publishing.test.ts`
+
+> **执行说明（2026-09-17）**：① 动作可见性做成「返回原因」而不是纯布尔（`getPublishingAutoPublishBlocker`）——
+> 界面要能说明禁用**为什么**，否则用户只看到一个点不动的按钮（本项目在侧栏折叠上吃过一次这个亏）；
+> ② **比计划多两处收紧**：`scheduled` 任务不给自动发布（否则「立即发布」会绕过用户设的排期）、
+> `cancelled` 不给；`failed` **给**（spec §9：绝不自动重试，由人再次点击正是既定通路）；
+> ③ 进行中（running/awaiting_code）时不给「自动发布」而是给「提交验证码」，避免必然 409；
+> 且在渲染层复刻了后端的 30 分钟僵死阈值（`AUTO_PUBLISH_STALE_MS`，注释指向后端常量）——
+> 否则一次被杀死的进程会让按钮**永久灰掉**；
+> ④ 弹窗类型 `PublishPreviewDialogPreview` 改为 `types/index.ts` 里 `PublishingPackagePreview` 的别名，
+> 避免前后端各写一份。
+>
+> **补做（2026-09-17，用户走查发现）**：本任务正文只列了「动作 + 验证码 + 提示」，**漏了 spec §13
+> 影响面里明写的「「预览」入口」**（§14.2 的两种进入方式之一：包/任务行「预览」按钮，随时查看，
+> 视频包走这个）。已补：`preview` 动作（只读、与任务状态无关、垃圾桶不给）+ 点击后只渲染「关闭」。
+> **计划与 spec 冲突时以 spec 为准。**
+
+**Interfaces:**
+- Consumes: Task 4 的两个接口
+- Produces: 「发布图文到抖音」动作、验证码输入框、待确认提示；`sauBinary` / `sauBaseDir` 配置项
+
+- [x] **Step 1: 写失败用例**
+
+`publishing.ts` 的动作可见性规则：仅当包为 `contentType === "note"` 且 `assetHealth` 不是 `missing_images` 且未在 `published` 状态时，提供 `auto-publish` 动作；`missing_images` 时提供禁用态与原因。
+
+- [x] **Step 2: 运行确认失败**
+
+Run: `node --import tsx --test renderer/src/utils/publishing.test.ts`
+
+- [x] **Step 3: 实现 UI 与透传**
+
+动作按钮 + `awaiting_code` 时的输入框（交互沿用现有 PIN 弹窗模式）+ `succeeded` 时在任务行显示「已提交，请在抖音后台确认后点『标记已发布』」。`sauBinary` / `sauBaseDir` 从 env 透传到 `createExpressApp`（对照现有 `hyperframesNpxBinary` 的写法）。
+
+- [x] **Step 4: 运行确认通过**
+
+Run: `node --import tsx --test renderer/src/utils/publishing.test.ts && npm run check`
+Expected: 用例通过、`tsc` 双端退出码 0。
+
+### Task 7: 全量验证、编译与人工复核
+
+> **执行记录（2026-09-17，全部完成）**：Step 1–6 均已勾选。Step 4 用**我们自己的 `SauRunner`** 跑真引擎
+> （`prepareAccountFile` 产出 58 段 cookie / 权限 600；`checkLogin` 返回 `valid`），未发布任何内容；
+> **Step 5 已由用户人工执行并成功**（首个真实成功发布，见 Step 5 的记录）。**真实发布过程中发现上游一处
+> 选择器过时并打了本地补丁**，补丁与取舍见 `docs/patches/`。
+>
+> **Step 3 的实际验证方式**（比计划更严）：造了一个联调图文包种进仓库 `storage/`，重启独立后端后
+> **先用 curl 打真接口**（7 条断言），再用 **headless Chrome 经 CDP 真点界面**（11 条断言，见截图
+> `/tmp/step3-preview-dialog.png`、`/tmp/step3-install-guidance.png`）。真机验证抓到两个单测抓不到的问题：
+> ① **`parseApiError` 在真实链路上永远返回兜底文案** —— `publishingRequest` 抛的是扁平化错误（没有
+> `response`），只认 axios 形状的解析器会把后端写的所有明确提示都吞掉（历史遗留 bug，界面上的发布
+> 错误一直显示「发布请求失败，请稍后重试」）；② **图文预览图是破图** —— `<img src>` 不会带
+> `X-Local-Session` 头，而图片接口是 `authenticated` 的 → 401；改为与既有封面缩略图同样「带会话取
+> blob」的做法。两条都补了回归用例。**教训：元素存在 ≠ 图上屏**，界面断言要落到 `img.naturalWidth > 0`。
+
+
+- [x] **Step 1: 类型检查与全量测试**
+
+Run: `npm run check && npm test`
+Expected: 仅剩既有失败 `src/lib/publishing-service.test.ts` → `startup recovery reports asset phases before due handling and purge`；基线见 `docs/worklog.md`。
+
+- [x] **Step 2: 编译并重启**
+
+Run: `npm run build:backend`，随后重启独立后端与 Electron。
+
+- [x] **Step 3: 未配置状态下的人为验证**
+
+不配置 `sauBinary`，在发布中心对图文包点「发布图文到抖音」→ 应看到明确的安装指引错误（含 Python 3.12 与补装 `playwright` 两个坑），且任务状态不变。
+
+- [x] **Step 4: 配置后只跑预检（不发布）**
+
+引擎装在 `~/social-auto-upload`（`uv venv --python 3.12` + 补装 `playwright` + `patchright install chromium`，
+442M+520M≈962M；两个坑实测成立）。用**我们自己的 `SauRunner`** 跑真引擎：`assertConfigured()` →
+`prepareAccountFile()` 产出 `cookies/douyin_mine.json`（58 段、域全 `.douyin.com`、含 `sessionid`、权限 600）→
+**`checkLogin()` 返回 `ok: true`、exitCode 0、输出 `valid`**。这同时证明 Task 3 的 argv 与 `valid/invalid`
+判定在真实 CLI 上成立。用户的原始 `douyin-cookie.txt` 只被读取、未被修改。
+
+> 安全探针（供后人复用）：想知道「配置是否生效」又不触发上传，可打 `POST .../auto-publish/code`——
+> `requireSauRunner()` 在方法最前面，未配置先抛 422，配置好则走到状态检查抛 409。全程不起浏览器。
+
+- [x] **Step 5: 真实发布留给人工决定 —— 已由用户执行并成功**
+
+**首次尝试失败**：`sau douyin upload-note` 在「开始填标题」后整整 120 秒退出（`failed`，**死在点「发布」之前，未发出任何内容**）。
+**只读 DOM 排查定位根因**（进发布页、塞图、不填表不点发布）：抖音把图文发布页标题框 placeholder 从
+「填写作品标题」改成「**添加作品标题**」，上游仍按旧文案匹配 → 旧选择器命中 **0**、`input[placeholder*="作品标题"]` 命中 **1**；
+描述框与发布按钮均命中 1（**无需改**）。**一行补丁**解决，patch 见 `docs/patches/sau-note-title-selector.patch`。
+**补丁后真实发布成功**（2026-09-17 21:14:36 → 21:15:09，整轮 34 秒）：日志逐行为
+`进入图文发布页面 → 填标题/描述/话题（标题 20 字、描述+话题 277 字、9 个话题）→ 图文发布成功 → cookie 更新完毕`；
+`autoPublish.status = succeeded`、message 结尾保留成功行；**任务仍为 `ready`、`publishedAt` 为空** ——
+最关键的不变式（退出码 0 只记「已提交」，绝不写 `published`）在真实成功场景下得到确认。
+副作用（设计如此）：`~/.douyin-ai-video/douyin-cookie.txt` 被 sau 回写刷新（5900 → 6102 字节）。
+
+- [x] **Step 6: 只暂存本特性文件并提交**（实际按特性/修复/文档拆成多个提交，见 worklog；提交前做了私密数据审计）
+
+```bash
+git add src/types.ts src/lib/publishing-platforms.ts src/lib/publishing-platforms.test.ts \
+        src/lib/publishing-assets.ts src/lib/publishing-assets.test.ts \
+        src/lib/sau-runner.ts src/lib/sau-runner.test.ts \
+        src/lib/publishing-routes.ts src/lib/publishing-store.ts \
+        src/lib/publishing-store.test.ts src/app.ts src/app.test.ts \
+        src/server.ts electron/server.ts \
+        renderer/src/pages/PublishingPage.tsx renderer/src/utils/publishing.ts \
+        renderer/src/utils/publishing.test.ts
+git commit -m "feat: 抖音图文自动发布（外部 sau 引擎 + 人工确认）"
+```

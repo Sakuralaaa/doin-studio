@@ -1,0 +1,1355 @@
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import path from "node:path";
+import type {
+  ActorSnapshot,
+  DeliveryPackage,
+  DueNotification,
+  PublishAuditEvent,
+  PublishAssetHealth,
+  PackageContentType,
+  PublishAutoPublish,
+  PublishAutoPublishStatus,
+  PublishPlatform,
+  PublishTask,
+  PublishTaskStatus,
+  PublishingIndex,
+  PublishingListFilters,
+  PublishingPackageDetail,
+  PublishingTombstone,
+} from "../types.js";
+import { LocalStorage } from "./storage.js";
+import { SYSTEM_ACTOR } from "./local-users.js";
+import { PUBLISH_PLATFORMS, resolveAutoPublishEngine } from "./publishing-platforms.js";
+
+const PUBLISHING_INDEX = "cache/publishing-index.json";
+const TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * 超过这个时长仍停在 running/awaiting_code 的自动发布视为「进程已死」：
+ * 我们的发布请求是同步的，进程被杀或应用崩溃会留下一条永远 running 的记录，
+ * 界面里没有任何入口能清掉它 —— 没有这个阈值，任务会被永久锁死。
+ * 取值必须大于单次上传的超时（sau-runner 的 900s），否则会误判活着的进程。
+ */
+const AUTO_PUBLISH_STALE_MS = 30 * 60 * 1000;
+const NO_WRITE = Symbol("publishing-no-write");
+
+type NoWrite<T> = { readonly [NO_WRITE]: true; readonly result: T };
+
+type PublishingCoordinator = {
+  writeTail: Promise<void>;
+  sourceLocks: Map<string, Promise<void>>;
+  index?: PublishingIndex;
+  initPromise?: Promise<void>;
+  initialized: boolean;
+  readOnlyError: PublishingError | null;
+};
+
+const COORDINATORS = new Map<string, PublishingCoordinator>();
+
+type PublishingErrorCode =
+  | "publish_asset_broken"
+  | "publish_auto_publish_code_unexpected"
+  | "publish_auto_publish_in_progress"
+  | "publish_auto_publish_unsupported"
+  | "publish_not_a_note_package"
+  | "publish_index_corrupt"
+  | "publish_invalid_transition"
+  | "publish_package_not_found"
+  | "publish_permission_denied"
+  | "publish_revision_conflict"
+  | "publish_task_not_found"
+  | "publish_validation_failed";
+
+const ERROR_MESSAGES: Record<PublishingErrorCode, string> = {
+  publish_asset_broken: "发布包视频资产异常，无法执行发布操作",
+  publish_auto_publish_code_unexpected: "该任务当前没有在等待短信验证码",
+  publish_auto_publish_in_progress: "该任务的图文自动发布正在进行中，请等本次结束后再试",
+  publish_auto_publish_unsupported: "该内容类型与平台的组合不支持自动发布，请走人工交付",
+  publish_not_a_note_package: "该发布包不是图文包，无法执行抖音图文自动发布",
+  publish_index_corrupt: "发布索引已损坏，当前处于只读保护状态",
+  publish_invalid_transition: "当前发布状态不允许执行此操作",
+  publish_package_not_found: "未找到发布包",
+  publish_permission_denied: "当前操作者无权执行此操作",
+  publish_revision_conflict: "发布内容已被修改，请刷新后重试",
+  publish_task_not_found: "未找到发布任务",
+  publish_validation_failed: "发布数据校验失败",
+};
+
+export class PublishingError extends Error {
+  constructor(
+    readonly code: PublishingErrorCode,
+    readonly details?: Record<string, unknown>
+  ) {
+    super(ERROR_MESSAGES[code]);
+    this.name = "PublishingError";
+  }
+}
+
+export interface NewPackageRecord {
+  package: DeliveryPackage;
+  tasks: PublishTask[];
+}
+
+export interface RestorePackageResult {
+  package: DeliveryPackage;
+  notifications: DueNotification[];
+}
+
+export class PublishingStore {
+  private readonly coordinator: PublishingCoordinator;
+
+  constructor(
+    private readonly storage: LocalStorage,
+    private readonly now = () => new Date()
+  ) {
+    const indexPath = canonicalIndexPath(storage);
+    let coordinator = COORDINATORS.get(indexPath);
+    if (!coordinator) {
+      coordinator = {
+        writeTail: Promise.resolve(),
+        sourceLocks: new Map(),
+        initialized: false,
+        readOnlyError: null,
+      };
+      COORDINATORS.set(indexPath, coordinator);
+    }
+    this.coordinator = coordinator;
+  }
+
+  async init(): Promise<void> {
+    if (this.coordinator.initialized) return;
+    if (!this.coordinator.initPromise) {
+      this.coordinator.initPromise = this.initializeCoordinator();
+    }
+    const initPromise = this.coordinator.initPromise;
+    try {
+      await initPromise;
+    } finally {
+      if (!this.coordinator.initialized && this.coordinator.initPromise === initPromise) {
+        this.coordinator.initPromise = undefined;
+      }
+    }
+  }
+
+  async snapshot(): Promise<PublishingIndex> {
+    return structuredClone(this.currentIndex());
+  }
+
+  async getTask(taskId: string): Promise<PublishTask | null> {
+    const task = this.currentIndex().tasks[taskId];
+    return task ? structuredClone(task) : null;
+  }
+
+  async getPackage(packageId: string): Promise<PublishingPackageDetail | null> {
+    const index = this.currentIndex();
+    const packageRecord = index.packages[packageId];
+    if (!packageRecord) return null;
+    return this.packageDetail(index, packageRecord);
+  }
+
+  async reserveVersion(
+    sourceJobId: string,
+    actor: ActorSnapshot = SYSTEM_ACTOR
+  ): Promise<number> {
+    return this.withSourceLock(sourceJobId, () => this.mutate((draft) => {
+      const version = draft.nextVersionBySource[sourceJobId] ?? 1;
+      draft.nextVersionBySource[sourceJobId] = version + 1;
+      draft.audit.push(this.auditEvent(`source:${sourceJobId}`, "source.reserve_version", actor, {
+        metadata: { sourceJobId, version },
+      }));
+      return version;
+    }));
+  }
+
+  async commitPackage(
+    input: NewPackageRecord,
+    actor: ActorSnapshot
+  ): Promise<PublishingPackageDetail> {
+    return this.withSourceLock(input.package.sourceJobId, () => this.mutate((draft) => {
+      const packageInput = structuredClone(input.package);
+      const taskInputs = structuredClone(input.tasks);
+      const nextVersion = draft.nextVersionBySource[packageInput.sourceJobId] ?? 1;
+      const versionTaken = Object.values(draft.packages).some((item) => (
+        item.sourceJobId === packageInput.sourceJobId && item.version === packageInput.version
+      ));
+      if (
+        draft.packages[packageInput.id] ||
+        versionTaken ||
+        packageInput.version < 1 ||
+        packageInput.version >= nextVersion
+      ) {
+        throw new PublishingError("publish_revision_conflict", {
+          sourceJobId: packageInput.sourceJobId,
+          version: packageInput.version,
+          nextVersion,
+        });
+      }
+      if (packageInput.state !== "active" || taskInputs.length === 0) {
+        throw new PublishingError("publish_validation_failed");
+      }
+
+      const taskIds = new Set<string>();
+      const platforms = new Set<string>();
+      const nowMs = this.now().getTime();
+      for (const task of taskInputs) {
+        if (
+          task.packageId !== packageInput.id ||
+          draft.tasks[task.id] ||
+          taskIds.has(task.id) ||
+          platforms.has(task.platform)
+        ) {
+          throw new PublishingError("publish_revision_conflict", {
+            packageId: packageInput.id,
+            taskId: task.id,
+            platform: task.platform,
+          });
+        }
+        if (!isValidInitialTask(task, nowMs)) {
+          throw new PublishingError("publish_validation_failed", {
+            taskId: task.id,
+            field: "status",
+          });
+        }
+        taskIds.add(task.id);
+        platforms.add(task.platform);
+      }
+
+      packageInput.createdBy = structuredClone(actor);
+      draft.packages[packageInput.id] = packageInput;
+      for (const task of taskInputs) draft.tasks[task.id] = task;
+      draft.audit.push(this.auditEvent(packageInput.id, "package.create", actor, {
+        metadata: { sourceJobId: packageInput.sourceJobId, version: packageInput.version },
+      }));
+      return this.packageDetail(draft, packageInput);
+    }));
+  }
+
+  async markPublished(
+    taskId: string,
+    actor: ActorSnapshot,
+    publishedAt = this.timestamp()
+  ): Promise<PublishTask> {
+    return this.transitionTask(taskId, "published", "task.mark_published", actor, (task) => {
+      task.publishedAt = publishedAt;
+      delete task.lastError;
+    });
+  }
+
+  async recordFailure(
+    taskId: string,
+    reason: string,
+    actor: ActorSnapshot
+  ): Promise<PublishTask> {
+    const safeReason = requireReason(reason);
+    return this.transitionTask(taskId, "failed", "task.record_failure", actor, (task) => {
+      task.lastError = safeReason;
+    }, safeReason);
+  }
+
+  async updateSchedule(
+    taskId: string,
+    scheduledAt: string | null,
+    actor: ActorSnapshot
+  ): Promise<PublishTask> {
+    const targetStatus = scheduleStatus(scheduledAt, this.now());
+    return this.mutate((draft) => {
+      const task = this.requireMutableTask(draft, taskId);
+      const fromStatus = task.status;
+      if (
+        (fromStatus !== "scheduled" && fromStatus !== "ready") ||
+        (fromStatus !== targetStatus && !canTransition(fromStatus, targetStatus))
+      ) {
+        throw new PublishingError("publish_invalid_transition", {
+          currentStatus: fromStatus,
+          targetStatus,
+          allowedStatuses: ALLOWED_TRANSITIONS[fromStatus],
+        });
+      }
+      task.status = targetStatus;
+      if (scheduledAt === null) delete task.scheduledAt;
+      else task.scheduledAt = new Date(scheduledAt).toISOString();
+      delete task.dueNotifiedAt;
+      task.updatedAt = this.timestamp();
+      draft.audit.push(this.auditEvent(task.packageId, "task.update_schedule", actor, {
+        taskId,
+        fromStatus,
+        toStatus: targetStatus,
+        metadata: scheduledAt === null ? { scheduledAt: null } : { scheduledAt: task.scheduledAt },
+      }));
+      return task;
+    });
+  }
+
+  async cancel(taskId: string, actor: ActorSnapshot): Promise<PublishTask> {
+    return this.transitionTask(taskId, "cancelled", "task.cancel", actor);
+  }
+
+  async restoreTask(
+    taskId: string,
+    scheduledAt: string | null,
+    actor: ActorSnapshot
+  ): Promise<PublishTask> {
+    const targetStatus = scheduleStatus(scheduledAt, this.now());
+    return this.transitionTask(taskId, targetStatus, "task.restore", actor, (task) => {
+      if (scheduledAt === null) delete task.scheduledAt;
+      else task.scheduledAt = new Date(scheduledAt).toISOString();
+      delete task.dueNotifiedAt;
+      delete task.lastError;
+    });
+  }
+
+  async withdraw(
+    taskId: string,
+    reason: string,
+    actor: ActorSnapshot
+  ): Promise<PublishTask> {
+    if (actor.role !== "admin") throw new PublishingError("publish_permission_denied");
+    const safeReason = requireReason(reason);
+    return this.transitionTask(taskId, "ready", "task.withdraw", actor, (task) => {
+      delete task.publishedAt;
+      delete task.lastError;
+      delete task.dueNotifiedAt;
+    }, safeReason);
+  }
+
+  async updateContent(
+    taskId: string,
+    input: {
+      title: string;
+      description: string;
+      hashtags: string[];
+      expectedRevision: number;
+    },
+    actor: ActorSnapshot
+  ): Promise<PublishTask> {
+    return this.mutate((draft) => {
+      const task = this.requireMutableTask(draft, taskId);
+      if (task.status === "published") {
+        throw new PublishingError("publish_invalid_transition", {
+          currentStatus: task.status,
+          allowedActions: ["withdraw"],
+        });
+      }
+      if (task.contentRevision !== input.expectedRevision) {
+        throw new PublishingError("publish_revision_conflict", {
+          expectedRevision: input.expectedRevision,
+          currentRevision: task.contentRevision,
+        });
+      }
+
+      task.title = input.title;
+      task.description = input.description;
+      task.hashtags = [...input.hashtags];
+      task.copySource = "user_edited";
+      task.contentRevision += 1;
+      task.updatedAt = this.timestamp();
+      draft.audit.push(this.auditEvent(task.packageId, "task.update_content", actor, {
+        taskId,
+        fromStatus: task.status,
+        toStatus: task.status,
+        metadata: { contentRevision: task.contentRevision },
+      }));
+      return task;
+    });
+  }
+
+  async recordActionError(
+    taskId: string,
+    action: "open_platform" | "show_in_finder",
+    message: string,
+    actor: ActorSnapshot
+  ): Promise<void> {
+    await this.mutate((draft) => {
+      const task = this.requireMutableTask(draft, taskId);
+      draft.audit.push(this.auditEvent(task.packageId, "task.action_error", actor, {
+        taskId,
+        reason: message,
+        metadata: { action },
+      }));
+    });
+  }
+
+  /**
+   * 包内容指纹（`previewRevision` 的包级形态）。
+   *
+   * 沿用 `PublishingPreview.previewRevision` 的语义，不新造一套：它是「将要发出去的内容」
+   * 的指纹，`auto-publish` 必须带上一致的值，否则拒绝。图文包覆盖**有序** imagePaths 与
+   * noteCopy（图片顺序发错事后只能删稿重发），视频包覆盖成片哈希；两者都覆盖各平台文案。
+   */
+  async previewRevision(packageId: string): Promise<string | null> {
+    const index = await this.snapshot();
+    const packageRecord = index.packages[packageId];
+    if (!packageRecord) return null;
+    return packagePreviewRevision(packageRecord, tasksOfPackage(index, packageId));
+  }
+
+  /**
+   * 原子地开始一次自动发布：图文校验 + previewRevision 比对 + 并发互斥 + 写入 running 记录。
+   *
+   * 三件事必须在**同一次** `mutate` 里完成：任何一项不满足都直接抛错且**不写盘**，
+   * 因此「校验失败不留 autoPublish 记录」是结构上成立的，而不是靠调用方记得先检查。
+   */
+  async beginAutoPublish(
+    taskId: string,
+    input: { previewRevision: string; attemptId: string },
+    actor: ActorSnapshot
+  ): Promise<PublishTask> {
+    return this.mutate((draft) => {
+      const task = this.requireMutableTask(draft, taskId);
+      const packageRecord = this.requirePackage(draft, task.packageId);
+
+      // 只有登记过的 (内容类型 × 平台) 组合允许自动发布；视频包仍是人工交付通路。
+      // 视频包保留**既有的错误码**（既有用例逐字断言它），其余未登记组合给更准确的新码。
+      const contentType = packageRecord.contentType ?? "video";
+      if (resolveAutoPublishEngine(contentType, task.platform) === null) {
+        if (contentType === "video") {
+          throw new PublishingError("publish_not_a_note_package", { contentType });
+        }
+        throw new PublishingError("publish_auto_publish_unsupported", {
+          contentType,
+          platform: task.platform,
+        });
+      }
+
+      const current = packagePreviewRevision(packageRecord, tasksOfPackage(draft, task.packageId));
+      if (current !== input.previewRevision) {
+        throw new PublishingError("publish_revision_conflict", {
+          expectedRevision: input.previewRevision,
+          currentRevision: current,
+        });
+      }
+
+      if (this.autoPublishInFlight(task)) {
+        throw new PublishingError("publish_auto_publish_in_progress", {
+          attemptId: task.autoPublish?.attemptId,
+          status: task.autoPublish?.status,
+        });
+      }
+
+      if (task.platform === "wechat_mp" && (
+        task.status === "published" || task.status === "cancelled"
+        || task.autoPublish?.status === "succeeded" || task.autoPublish?.status === "running"
+        || task.autoPublish?.outcomeUncertain || task.autoPublish?.draftMediaId
+      )) {
+        throw new PublishingError("publish_invalid_transition", { reason: "wechat_draft_requires_manual_verification" });
+      }
+      const startedAt = this.timestamp();
+      task.autoPublish = { status: "running", startedAt, attemptId: input.attemptId };
+      task.updatedAt = startedAt;
+      draft.audit.push(this.auditEvent(task.packageId, "task.auto_publish_start", actor, {
+        taskId,
+        fromStatus: task.status,
+        toStatus: task.status,
+        metadata: { attemptId: input.attemptId },
+      }));
+      return task;
+    });
+  }
+
+  /**
+   * 更新自动发布进度。
+   *
+   * **绝不触碰 `task.status`**：退出码 0 只表示「已提交」，是否真的发出去了仍由人工点
+   * 「标记已发布」确认。这是本设计最关键的一条不变式。
+   */
+  async updateAutoPublish(
+    taskId: string,
+    patch: { status: PublishAutoPublishStatus; message?: string; finishedAt?: string; draftOnly?: boolean; xhsDraftId?: string; draftMediaId?: string; outcomeUncertain?: boolean },
+    actor: ActorSnapshot
+  ): Promise<PublishTask> {
+    return this.mutate((draft) => {
+      const task = this.requireMutableTask(draft, taskId);
+      const record = task.autoPublish;
+      if (!record) {
+        throw new PublishingError("publish_invalid_transition", { reason: "auto_publish_absent" });
+      }
+
+      const finished = patch.status === "awaiting_code"
+        ? undefined
+        : patch.finishedAt ?? this.timestamp();
+      task.autoPublish = {
+        status: patch.status,
+        startedAt: record.startedAt,
+        attemptId: record.attemptId,
+        ...(patch.message === undefined ? {} : { message: patch.message }),
+        ...(finished === undefined ? {} : { finishedAt: finished }),
+        // 「只填到草稿」必须**显式**记下来：界面据此说「已填写到草稿箱」而不是「已提交」。
+        ...(patch.draftOnly === undefined ? {} : { draftOnly: patch.draftOnly }),
+        ...(patch.xhsDraftId === undefined ? {} : { xhsDraftId: patch.xhsDraftId }),
+        ...(patch.draftMediaId === undefined ? {} : { draftMediaId: patch.draftMediaId }),
+        ...(patch.outcomeUncertain === undefined ? {} : { outcomeUncertain: patch.outcomeUncertain }),
+      };
+      task.updatedAt = this.timestamp();
+      draft.audit.push(this.auditEvent(task.packageId, `task.auto_publish_${patch.status}`, actor, {
+        taskId,
+        fromStatus: task.status,
+        toStatus: task.status,
+        ...(patch.message === undefined ? {} : { reason: patch.message }),
+      }));
+      return task;
+    });
+  }
+
+  /** 记录一次验证码投喂（内容本身写进 sau 的 `verify_code.txt`，不进索引）。 */
+  async recordAutoPublishCode(taskId: string, actor: ActorSnapshot): Promise<PublishTask> {
+    return this.mutate((draft) => {
+      const task = this.requireMutableTask(draft, taskId);
+      if (task.autoPublish?.status !== "awaiting_code") {
+        throw new PublishingError("publish_auto_publish_code_unexpected", {
+          status: task.autoPublish?.status,
+        });
+      }
+      draft.audit.push(this.auditEvent(task.packageId, "task.auto_publish_code", actor, {
+        taskId,
+        fromStatus: task.status,
+        toStatus: task.status,
+      }));
+      return task;
+    });
+  }
+
+  /**
+   * 该平台此刻是否有自动发布在跑。
+   *
+   * 运行环境的深检要据此让路（spec §5.2 规则 1）：深检与发布共用同一个浏览器 profile
+   * 目录，同时跑会互相破坏。**按平台**问、跨平台答 `false` —— 抖音深检不该挡住头条发布。
+   *
+   * 判定复用 `autoPublishInFlight`（同一份僵死阈值），不在调用方重写一遍。
+   */
+  async hasAutoPublishInFlight(platform: PublishPlatform): Promise<boolean> {
+    const index = await this.snapshot();
+    return Object.values(index.tasks).some(
+      (task) => task.platform === platform && this.autoPublishInFlight(task),
+    );
+  }
+
+  private autoPublishInFlight(task: PublishTask): boolean {
+    const record = task.autoPublish;
+    if (!record) return false;
+    if (record.status !== "running" && record.status !== "awaiting_code") return false;
+    const startedAt = new Date(record.startedAt).getTime();
+    if (!Number.isFinite(startedAt)) return false;
+    return this.now().getTime() - startedAt < AUTO_PUBLISH_STALE_MS;
+  }
+
+  async processDue(now = this.now()): Promise<DueNotification[]> {
+    return this.mutate((draft) => {
+      const notifications = this.processDueInDraft(draft, now);
+      return notifications.length > 0 ? notifications : noWrite(notifications);
+    });
+  }
+
+  async trashPackage(packageId: string, actor: ActorSnapshot): Promise<DeliveryPackage> {
+    return this.mutate((draft) => {
+      const packageRecord = this.requirePackage(draft, packageId);
+      if (packageRecord.state !== "active") {
+        throw new PublishingError("publish_invalid_transition", {
+          packageState: packageRecord.state,
+          targetState: "trashed",
+        });
+      }
+      const deletedAt = this.now();
+      packageRecord.state = "trashed";
+      packageRecord.deletedAt = deletedAt.toISOString();
+      packageRecord.purgeAt = new Date(deletedAt.getTime() + TRASH_RETENTION_MS).toISOString();
+      packageRecord.updatedAt = packageRecord.deletedAt;
+      draft.audit.push(this.auditEvent(packageId, "package.trash", actor, {
+        metadata: { fromState: "active", toState: "trashed" },
+      }));
+      return packageRecord;
+    });
+  }
+
+  async restorePackage(
+    packageId: string,
+    actor: ActorSnapshot
+  ): Promise<RestorePackageResult> {
+    return this.mutate((draft) => {
+      const packageRecord = this.requirePackage(draft, packageId);
+      if (packageRecord.state !== "trashed") {
+        throw new PublishingError("publish_invalid_transition", {
+          packageState: packageRecord.state,
+          targetState: "active",
+        });
+      }
+      const restoredAt = this.now();
+      if (packageRecord.purgeAt && new Date(packageRecord.purgeAt).getTime() <= restoredAt.getTime()) {
+        throw new PublishingError("publish_invalid_transition", {
+          packageState: packageRecord.state,
+          targetState: "active",
+          reason: "trash_expired",
+        });
+      }
+      packageRecord.state = "active";
+      delete packageRecord.deletedAt;
+      delete packageRecord.purgeAt;
+      delete packageRecord.purgedAt;
+      packageRecord.updatedAt = restoredAt.toISOString();
+      draft.audit.push(this.auditEvent(
+        packageId,
+        "package.restore",
+        actor,
+        { metadata: { fromState: "trashed", toState: "active" } },
+        restoredAt.toISOString()
+      ));
+      const notifications = this.processDueInDraft(draft, restoredAt, packageId);
+      return { package: packageRecord, notifications };
+    });
+  }
+
+  async setAssetHealth(
+    packageId: string,
+    health: PublishAssetHealth,
+    actor: ActorSnapshot
+  ): Promise<DeliveryPackage> {
+    return this.mutate((draft) => {
+      const packageRecord = this.requirePackage(draft, packageId);
+      if (packageRecord.state !== "active") {
+        throw new PublishingError("publish_invalid_transition", {
+          packageState: packageRecord.state,
+        });
+      }
+      const previousHealth = packageRecord.assetHealth;
+      packageRecord.assetHealth = health;
+      packageRecord.updatedAt = this.timestamp();
+      draft.audit.push(this.auditEvent(packageId, "package.asset_health", actor, {
+        metadata: { fromState: previousHealth, toState: health },
+      }));
+      return packageRecord;
+    });
+  }
+
+  async markPurged(
+    packageId: string,
+    actor: ActorSnapshot = SYSTEM_ACTOR
+  ): Promise<PublishingTombstone> {
+    return this.mutate((draft) => {
+      const packageRecord = this.requirePackage(draft, packageId);
+      if (packageRecord.state !== "trashed") {
+        throw new PublishingError("publish_invalid_transition", {
+          packageState: packageRecord.state,
+          targetState: "purged",
+        });
+      }
+      const purgedAt = this.now();
+      const purgeAtMs = packageRecord.purgeAt
+        ? new Date(packageRecord.purgeAt).getTime()
+        : Number.NaN;
+      if (!packageRecord.deletedAt || !Number.isFinite(purgeAtMs)) {
+        throw new PublishingError("publish_validation_failed", { packageId });
+      }
+      if (purgeAtMs > purgedAt.getTime()) {
+        throw new PublishingError("publish_invalid_transition", {
+          packageState: packageRecord.state,
+          purgeAt: packageRecord.purgeAt,
+        });
+      }
+
+      const tasks = Object.values(draft.tasks).filter((task) => task.packageId === packageId);
+      const purgeAudit = this.auditEvent(packageId, "package.purge", actor, {
+        metadata: { fromState: "trashed", toState: "purged" },
+      }, purgedAt.toISOString());
+      draft.audit.push(purgeAudit);
+      const publishedAt = tasks
+        .flatMap((task) => task.publishedAt ? [task.publishedAt] : [])
+        .sort()
+        .at(-1);
+      const tombstone: PublishingTombstone = {
+        packageId,
+        sourceJobId: packageRecord.sourceJobId,
+        version: packageRecord.version,
+        platforms: tasks.map((task) => ({
+          platform: task.platform,
+          finalStatus: task.status,
+        })),
+        createdAt: packageRecord.createdAt,
+        deletedAt: packageRecord.deletedAt,
+        purgedAt: purgedAt.toISOString(),
+        videoSha256: packageRecord.videoSha256,
+        auditSummary: draft.audit
+          .filter((event) => event.packageId === packageId)
+          .map((event) => ({
+            action: event.action,
+            actor: structuredClone(event.actor),
+            createdAt: event.createdAt,
+          })),
+      };
+      if (publishedAt) tombstone.publishedAt = publishedAt;
+
+      packageRecord.state = "purged";
+      packageRecord.purgedAt = purgedAt.toISOString();
+      packageRecord.updatedAt = purgedAt.toISOString();
+      for (const task of tasks) delete draft.tasks[task.id];
+      draft.tombstones[packageId] = tombstone;
+      return tombstone;
+    });
+  }
+
+  async recordPurgeFailure(
+    packageId: string,
+    message: string,
+    actor: ActorSnapshot
+  ): Promise<void> {
+    const safeMessage = requireReason(message);
+    await this.mutate((draft) => {
+      const packageRecord = this.requirePackage(draft, packageId);
+      if (packageRecord.state !== "trashed") {
+        throw new PublishingError("publish_invalid_transition", {
+          packageState: packageRecord.state,
+        });
+      }
+      draft.audit.push(this.auditEvent(packageId, "package.purge_failed", actor, {
+        reason: safeMessage,
+      }));
+    });
+  }
+
+  async list(filters: PublishingListFilters): Promise<PublishingPackageDetail[]> {
+    const index = this.currentIndex();
+    const status = filters.status ?? "action";
+    return Object.values(index.packages)
+      .filter((packageRecord) => {
+        const tasks = Object.values(index.tasks).filter((task) => task.packageId === packageRecord.id);
+        if (status === "trash") {
+          if (packageRecord.state !== "trashed") return false;
+        } else {
+          if (packageRecord.state !== "active") return false;
+          if (status === "action") {
+            if (
+              packageRecord.assetHealth !== "broken_video" &&
+              !tasks.some((task) => task.status === "ready" || task.status === "failed")
+            ) return false;
+          } else if (status === "broken") {
+            if (packageRecord.assetHealth === "healthy") return false;
+          } else if (status !== "all" && !tasks.some((task) => task.status === status)) {
+            return false;
+          }
+        }
+        // 渠道过滤：与 `verifyPackageHealth` 等处同一口径 —— 缺省即视频包。
+        if (filters.contentType && (packageRecord.contentType ?? "video") !== filters.contentType) return false;
+        if (filters.platform && !tasks.some((task) => task.platform === filters.platform)) return false;
+        if (filters.sourceJobId && packageRecord.sourceJobId !== filters.sourceJobId) return false;
+        if (filters.version !== undefined && packageRecord.version !== filters.version) return false;
+        if (filters.createdBy && packageRecord.createdBy.userId !== filters.createdBy) return false;
+        if (filters.search && !matchesSearch(packageRecord, tasks, filters.search)) return false;
+        return true;
+      })
+      .sort((a, b) => (
+        b.createdAt.localeCompare(a.createdAt) ||
+        b.version - a.version ||
+        a.id.localeCompare(b.id)
+      ))
+      .map((packageRecord) => this.packageDetail(index, packageRecord));
+  }
+
+  private processDueInDraft(
+    draft: PublishingIndex,
+    now: Date,
+    onlyPackageId?: string
+  ): DueNotification[] {
+    const nowMs = now.getTime();
+    const becameReadyAt = now.toISOString();
+    const notifications: DueNotification[] = [];
+    for (const task of Object.values(draft.tasks)) {
+      const packageRecord = draft.packages[task.packageId];
+      if (
+        (onlyPackageId && task.packageId !== onlyPackageId) ||
+        packageRecord?.state !== "active" ||
+        task.status !== "scheduled" ||
+        !task.scheduledAt ||
+        task.dueNotifiedAt
+      ) {
+        continue;
+      }
+      const scheduledMs = new Date(task.scheduledAt).getTime();
+      if (!Number.isFinite(scheduledMs) || scheduledMs > nowMs) continue;
+
+      task.status = "ready";
+      task.dueNotifiedAt = becameReadyAt;
+      task.updatedAt = becameReadyAt;
+      draft.audit.push(this.auditEvent(task.packageId, "task.due", SYSTEM_ACTOR, {
+        taskId: task.id,
+        fromStatus: "scheduled",
+        toStatus: "ready",
+        metadata: { scheduledAt: task.scheduledAt, overdueMs: nowMs - scheduledMs },
+      }, becameReadyAt));
+      notifications.push({
+        taskId: task.id,
+        packageId: task.packageId,
+        platform: task.platform,
+        platformLabel: PUBLISH_PLATFORMS[task.platform].label,
+        title: task.title,
+        scheduledAt: task.scheduledAt,
+        becameReadyAt,
+        overdueMs: nowMs - scheduledMs,
+      });
+    }
+    return notifications;
+  }
+
+  private async transitionTask(
+    taskId: string,
+    toStatus: PublishTaskStatus,
+    action: string,
+    actor: ActorSnapshot,
+    update?: (task: PublishTask) => void,
+    reason?: string
+  ): Promise<PublishTask> {
+    return this.mutate((draft) => {
+      const task = this.requireMutableTask(draft, taskId);
+      const fromStatus = task.status;
+      if (!canTransition(fromStatus, toStatus)) {
+        throw new PublishingError("publish_invalid_transition", {
+          currentStatus: fromStatus,
+          targetStatus: toStatus,
+          allowedStatuses: ALLOWED_TRANSITIONS[fromStatus],
+        });
+      }
+      if (toStatus === "published") {
+        const packageRecord = draft.packages[task.packageId];
+        if (packageRecord.assetHealth === "broken_video") {
+          throw new PublishingError("publish_asset_broken");
+        }
+      }
+
+      task.status = toStatus;
+      task.updatedAt = this.timestamp();
+      update?.(task);
+      draft.audit.push(this.auditEvent(task.packageId, action, actor, {
+        taskId,
+        fromStatus,
+        toStatus,
+        reason,
+      }));
+      return task;
+    });
+  }
+
+  private requireMutableTask(index: PublishingIndex, taskId: string): PublishTask {
+    const task = index.tasks[taskId];
+    if (!task) throw new PublishingError("publish_task_not_found");
+    const packageRecord = index.packages[task.packageId];
+    if (!packageRecord) throw new PublishingError("publish_package_not_found");
+    if (packageRecord.state !== "active") {
+      throw new PublishingError("publish_invalid_transition", { packageState: packageRecord.state });
+    }
+    return task;
+  }
+
+  private requirePackage(index: PublishingIndex, packageId: string): DeliveryPackage {
+    const packageRecord = index.packages[packageId];
+    if (!packageRecord) throw new PublishingError("publish_package_not_found");
+    return packageRecord;
+  }
+
+  private packageDetail(
+    index: PublishingIndex,
+    packageRecord: DeliveryPackage
+  ): PublishingPackageDetail {
+    const detail: PublishingPackageDetail = {
+      package: structuredClone(packageRecord),
+      tasks: Object.values(index.tasks)
+        .filter((task) => task.packageId === packageRecord.id)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+        .map((task) => structuredClone(task)),
+      audit: index.audit
+        .filter((event) => event.packageId === packageRecord.id)
+        .map((event) => structuredClone(event)),
+    };
+    const tombstone = index.tombstones[packageRecord.id];
+    if (tombstone) detail.tombstone = structuredClone(tombstone);
+    return detail;
+  }
+
+  private auditEvent(
+    packageId: string,
+    action: string,
+    actor: ActorSnapshot,
+    fields: Partial<PublishAuditEvent> = {},
+    createdAt = this.timestamp()
+  ): PublishAuditEvent {
+    const event: PublishAuditEvent = {
+      id: randomUUID(),
+      packageId,
+      action,
+      actor: structuredClone(actor),
+      createdAt,
+    };
+    if (fields.taskId !== undefined) event.taskId = fields.taskId;
+    if (fields.fromStatus !== undefined) event.fromStatus = fields.fromStatus;
+    if (fields.toStatus !== undefined) event.toStatus = fields.toStatus;
+    if (fields.reason !== undefined) event.reason = fields.reason;
+    if (fields.metadata !== undefined) event.metadata = structuredClone(fields.metadata);
+    return event;
+  }
+
+  private timestamp(): string {
+    return this.now().toISOString();
+  }
+
+  private async mutate<T>(change: (draft: PublishingIndex) => T | NoWrite<T>): Promise<T> {
+    return this.enqueueWrite(async () => {
+      if (this.coordinator.readOnlyError) throw this.coordinator.readOnlyError;
+      const draft = structuredClone(this.currentIndex());
+      const result = change(draft);
+      if (isNoWrite(result)) return structuredClone(result.result);
+      draft.revision += 1;
+      await this.storage.writeJsonAtomic(PUBLISHING_INDEX, draft);
+      this.coordinator.index = draft;
+      return structuredClone(result);
+    });
+  }
+
+  private async enqueueWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const queued = this.coordinator.writeTail.then(operation, operation);
+    this.coordinator.writeTail = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  private async withSourceLock<T>(sourceJobId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.coordinator.sourceLocks.get(sourceJobId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.coordinator.sourceLocks.set(sourceJobId, tail);
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.coordinator.sourceLocks.get(sourceJobId) === tail) {
+        this.coordinator.sourceLocks.delete(sourceJobId);
+      }
+    }
+  }
+
+  private async initializeCoordinator(): Promise<void> {
+    try {
+      const index = await this.storage.readJson<PublishingIndex>(PUBLISHING_INDEX);
+      if (!isPublishingIndex(index)) throw new InvalidPublishingIndexError();
+      this.coordinator.index = index;
+      this.coordinator.readOnlyError = null;
+      this.coordinator.initialized = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        const index = emptyIndex();
+        await this.storage.writeJsonAtomic(PUBLISHING_INDEX, index);
+        this.coordinator.index = index;
+        this.coordinator.readOnlyError = null;
+        this.coordinator.initialized = true;
+        return;
+      }
+      if (error instanceof SyntaxError || error instanceof InvalidPublishingIndexError) {
+        this.coordinator.index = emptyIndex();
+        this.coordinator.readOnlyError = new PublishingError("publish_index_corrupt");
+        this.coordinator.initialized = true;
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private currentIndex(): PublishingIndex {
+    if (this.coordinator.index) return this.coordinator.index;
+    throw this.coordinator.readOnlyError ?? new PublishingError("publish_index_corrupt");
+  }
+}
+
+class InvalidPublishingIndexError extends Error {}
+
+function canonicalIndexPath(storage: LocalStorage): string {
+  const basePath = path.resolve(storage.resolve());
+  try {
+    return path.join(realpathSync.native(basePath), PUBLISHING_INDEX);
+  } catch {
+    return path.resolve(storage.resolve(PUBLISHING_INDEX));
+  }
+}
+
+const ALLOWED_TRANSITIONS: Record<PublishTaskStatus, readonly PublishTaskStatus[]> = {
+  scheduled: ["ready", "cancelled", "failed"],
+  ready: ["scheduled", "published", "failed", "cancelled"],
+  failed: ["ready", "scheduled", "cancelled"],
+  cancelled: ["ready", "scheduled"],
+  published: ["ready"],
+};
+
+function canTransition(from: PublishTaskStatus, to: PublishTaskStatus): boolean {
+  return ALLOWED_TRANSITIONS[from].includes(to);
+}
+
+function scheduleStatus(scheduledAt: string | null, now: Date): "scheduled" | "ready" {
+  if (scheduledAt === null) return "ready";
+  const scheduledMs = new Date(scheduledAt).getTime();
+  if (!Number.isFinite(scheduledMs)) {
+    throw new PublishingError("publish_validation_failed", { field: "scheduledAt" });
+  }
+  return scheduledMs > now.getTime() ? "scheduled" : "ready";
+}
+
+function requireReason(reason: string): string {
+  const safeReason = reason.trim();
+  if (!safeReason) {
+    throw new PublishingError("publish_validation_failed", { field: "reason" });
+  }
+  return safeReason;
+}
+
+function isValidInitialTask(task: PublishTask, nowMs: number): boolean {
+  if (
+    task.publishedAt !== undefined ||
+    task.dueNotifiedAt !== undefined ||
+    task.lastError !== undefined
+  ) return false;
+  if (task.status === "ready") return task.scheduledAt === undefined;
+  if (task.status !== "scheduled" || task.scheduledAt === undefined) return false;
+  const scheduledMs = new Date(task.scheduledAt).getTime();
+  return Number.isFinite(scheduledMs) && scheduledMs > nowMs;
+}
+
+function matchesSearch(
+  packageRecord: DeliveryPackage,
+  tasks: PublishTask[],
+  search: string
+): boolean {
+  const needle = search.trim().toLocaleLowerCase("zh-CN");
+  if (!needle) return true;
+  const values = [
+    packageRecord.title,
+    packageRecord.sourceJobId,
+    ...tasks.flatMap((task) => [
+      task.title,
+      task.description,
+      task.platform,
+      ...task.hashtags,
+    ]),
+  ];
+  return values.some((value) => value.toLocaleLowerCase("zh-CN").includes(needle));
+}
+
+function noWrite<T>(result: T): NoWrite<T> {
+  return { [NO_WRITE]: true, result };
+}
+
+function isNoWrite<T>(value: T | NoWrite<T>): value is NoWrite<T> {
+  return !!value && typeof value === "object" && NO_WRITE in value;
+}
+
+function emptyIndex(): PublishingIndex {
+  return {
+    schemaVersion: 1,
+    revision: 0,
+    nextVersionBySource: {},
+    packages: {},
+    tasks: {},
+    audit: [],
+    tombstones: {},
+  };
+}
+
+function tasksOfPackage(index: PublishingIndex, packageId: string): PublishTask[] {
+  return Object.values(index.tasks).filter((task) => task.packageId === packageId);
+}
+
+/**
+ * 包级内容指纹：`sha256` over 内容类型、包的完整性凭据、图文文案、以及**排序后**的各平台文案。
+ *
+ * 顺序敏感的地方有三处：图文 `imagePaths` 的顺序、以及每个任务的 hashtags 顺序。
+ * 任务按 (platform, id) 排序，因此索引里的插入顺序不影响指纹。
+ */
+export function packagePreviewRevision(
+  packageRecord: DeliveryPackage,
+  tasks: PublishTask[]
+): string {
+  const hash = createHash("sha256");
+  const contentType = packageRecord.contentType ?? "video";
+  hash.update(`contentType:${contentType}\0`);
+  hash.update(`package:${packageRecord.id}:${packageRecord.version}\0`);
+  hash.update(`title:${packageRecord.title}\0`);
+  if (contentType === "note") {
+    for (const imagePath of packageRecord.imagePaths ?? []) hash.update(`image:${imagePath}\0`);
+    hash.update(`noteTitle:${packageRecord.noteCopy?.title ?? ""}\0`);
+    hash.update(`noteBody:${packageRecord.noteCopy?.description ?? ""}\0`);
+    hash.update(`noteTags:${(packageRecord.noteCopy?.hashtags ?? []).join(",")}\0`);
+    // ⚠️ **只在存在时参与哈希**：无条件追加（哪怕只多一个 `\0` 参数）会改掉**所有既有抖音
+    // 图文包**的 `previewRevision` —— 于是「预览过、还没提交」的包会突然全部 409。
+    // 那种红是「指纹口径被悄悄改了」，不是「功能坏了」，所以有用例把改动前的哈希写死当 baseline。
+    if (packageRecord.xhsOptions !== undefined) {
+      hash.update(`xhsAiDeclaration:${packageRecord.xhsOptions.aiDeclaration ? 1 : 0}\0`);
+      hash.update(`xhsSubmit:${packageRecord.xhsOptions.submit ? 1 : 0}\0`);
+    }
+  } else if (contentType === "article") {
+    // 文章包的内容凭据是**正文 HTML 的哈希**，不是成片哈希；封面与头条选项同样决定
+    // 「发出去的是什么」，所以一并进指纹（spec §6.3：这三样少一个，预览就能被绕过）。
+    hash.update(`articleTitle:${packageRecord.articleCopy?.title ?? ""}\0`);
+    hash.update(`articleHtml:${packageRecord.articleCopy?.htmlSha256 ?? ""}\0`);
+    if (packageRecord.articleCopy?.author !== undefined) hash.update(`articleAuthor:${packageRecord.articleCopy.author}\0`);
+    if (packageRecord.articleCopy?.digest !== undefined) hash.update(`articleDigest:${packageRecord.articleCopy.digest}\0`);
+    for (const imagePath of packageRecord.imagePaths ?? []) hash.update(`image:${imagePath}\0`);
+    // ⚠️ **已知限制（如实记录）**：这里绑定的是封面的**存在性与声明文件名**，不是它的字节。
+    // 文章包的封面固定叫 `cover.jpg`，所以「换掉包内封面文件」**不会**让 revision 失效。
+    // 之所以先接受：包目录由打包层在文件锁内写入，威胁模型与「改写 article.html」同级，
+    // 而后者已经由 `articleCopy.htmlSha256` 覆盖。要彻底收紧的话需要在记录里加
+    // `coverSha256`（打包时算、指纹里比），那会牵动存档校验与既有哈希 baseline。
+    hash.update(`cover:${packageRecord.coverPath ? path.basename(packageRecord.coverPath) : ""}\0`);
+    const options = packageRecord.toutiaoOptions;
+    hash.update(`firstPublish:${options?.firstPublish ? 1 : 0}\0`);
+    // 集合语义：声明的顺序不该影响指纹。
+    hash.update(`declarations:${[...(options?.declarations ?? [])].sort().join(",")}\0`);
+    hash.update(`weitoutiao:${options?.crossPostWeitoutiao ? 1 : 0}\0`);
+  } else {
+    hash.update(`videoSha256:${packageRecord.videoSha256}\0`);
+    hash.update(`videoSize:${packageRecord.videoSize}\0`);
+  }
+  for (const task of [...tasks].sort((left, right) => (
+    left.platform.localeCompare(right.platform) || left.id.localeCompare(right.id)
+  ))) {
+    hash.update(`task:${task.id}:${task.platform}\0`);
+    hash.update(`taskTitle:${task.title}\0`);
+    hash.update(`taskBody:${task.description}\0`);
+    hash.update(`taskTags:${task.hashtags.join(",")}\0`);
+    hash.update(`taskRevision:${task.contentRevision}\0`);
+  }
+  return hash.digest("hex");
+}
+
+function isPublishingIndex(value: unknown): value is PublishingIndex {
+  if (!value || typeof value !== "object") return false;
+  const index = value as Partial<PublishingIndex>;
+  if (!(
+    index.schemaVersion === 1 &&
+    Number.isInteger(index.revision) &&
+    (index.revision ?? -1) >= 0 &&
+    isRecord(index.nextVersionBySource) &&
+    isRecord(index.packages) &&
+    isRecord(index.tasks) &&
+    Array.isArray(index.audit) &&
+    isRecord(index.tombstones)
+  )) return false;
+
+  if (!Object.values(index.nextVersionBySource).every(isPositiveInteger)) return false;
+  if (!Object.entries(index.packages).every(([id, item]) => isDeliveryPackage(item, id))) return false;
+  if (!Object.entries(index.tasks).every(([id, item]) => isPublishTask(item, id))) return false;
+  if (!index.audit.every(isAuditEvent)) return false;
+  if (!Object.entries(index.tombstones).every(([id, item]) => isTombstone(item, id))) return false;
+  return Object.values(index.tasks).every((task) => !!index.packages?.[task.packageId]);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) > 0;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || isString(value);
+}
+
+function isActor(value: unknown): value is ActorSnapshot {
+  if (!isRecord(value)) return false;
+  return (
+    isString(value.userId) &&
+    isString(value.displayName) &&
+    (value.role === "admin" || value.role === "publisher" || value.role === "system")
+  );
+}
+
+function isDeliveryPackage(value: unknown, key: string): value is DeliveryPackage {
+  if (!isRecord(value)) return false;
+  return (
+    value.id === key &&
+    isString(value.sourceJobId) &&
+    (value.sourceKind === undefined || value.sourceKind === "job" || value.sourceKind === "article") &&
+    (value.sourceKind === "article" ? typeof value.sourceArticleId === "string" && /^[a-f0-9-]{36}$/.test(value.sourceArticleId)
+      && value.sourceJobId === `article-${value.sourceArticleId}` && value.contentType === "article" : value.sourceArticleId === undefined) &&
+    isPositiveInteger(value.version) &&
+    (value.state === "active" || value.state === "trashed" || value.state === "purged") &&
+    isString(value.title) &&
+    isString(value.packagePath) &&
+    isOptionalString(value.videoPath) &&
+    isOptionalString(value.coverPath) &&
+    isString(value.videoSha256) &&
+    typeof value.videoSize === "number" &&
+    Number.isFinite(value.videoSize) &&
+    (value.videoMethod === "clone" || value.videoMethod === "copy") &&
+    (value.assetHealth === "healthy" ||
+      value.assetHealth === "missing_cover" ||
+      value.assetHealth === "broken_video" ||
+      value.assetHealth === "missing_images") &&
+    isActor(value.createdBy) &&
+    isString(value.createdAt) &&
+    isString(value.updatedAt) &&
+    isOptionalString(value.deletedAt) &&
+    isOptionalString(value.purgeAt) &&
+    isOptionalString(value.purgedAt) &&
+    (value.contentType === undefined || value.contentType === "video" || value.contentType === "note"
+      || value.contentType === "article") &&
+    (value.imagePaths === undefined
+      || (Array.isArray(value.imagePaths) && value.imagePaths.every(isString))) &&
+    (value.noteCopy === undefined || isPlatformCopyShape(value.noteCopy)) &&
+    (value.articleCopy === undefined || isWechatArticleCopyShape(value.articleCopy))
+    && (value.toutiaoOptions === undefined || isToutiaoOptionsShape(value.toutiaoOptions))
+    && (value.xhsOptions === undefined || isXhsNoteOptionsShape(value.xhsOptions))
+  );
+}
+
+function isPlatformCopyShape(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return isString(value.title) && isString(value.description)
+    && Array.isArray(value.hashtags) && value.hashtags.every(isString);
+}
+
+/**
+ * 文章包文案的形状校验。
+ *
+ * `digest`/`author` 是**可选**的（摘要缺省合法：微信会抓正文前 54 字），
+ * 但 `htmlSha256` 必须在 —— 它是包内容完整性的唯一凭据。
+ */
+/**
+ * 头条发布选项的存档形状。
+ *
+ * 漏了这一步的后果很具体：畸形值（比如 `declarations` 是字符串）会让
+ * `packagePreviewRevision` 里的 `[...options.declarations]` 抛 TypeError → 500，
+ * 而正确的行为是「索引损坏」——本项目对索引的既定口径。
+ */
+function isToutiaoOptionsShape(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return typeof value.firstPublish === "boolean"
+    && typeof value.crossPostWeitoutiao === "boolean"
+    && Array.isArray(value.declarations)
+    && value.declarations.every(isString);
+}
+
+/**
+ * 小红书图文发布选项的存档形状。
+ *
+ * 与头条那份同一条理由：畸形值（比如 `aiDeclaration` 是字符串）会让指纹计算与提交前的
+ * 合规校验拿到意料之外的类型；正确行为是「索引损坏」这条既定口径，而不是静默把字段丢掉
+ *（丢掉字段会让「本该声明 AI」的包变成「没声明」）。
+ */
+function isXhsNoteOptionsShape(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return typeof value.aiDeclaration === "boolean" && typeof value.submit === "boolean";
+}
+
+function isWechatArticleCopyShape(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return isString(value.title)
+    && isOptionalString(value.digest)
+    && isOptionalString(value.author)
+    && isString(value.htmlSha256);
+}
+
+function isPublishTask(value: unknown, key: string): value is PublishTask {
+  if (!isRecord(value)) return false;
+  return (
+    value.id === key &&
+    isString(value.packageId) &&
+    isPlatform(value.platform) &&
+    isString(value.title) &&
+    isString(value.description) &&
+    Array.isArray(value.hashtags) &&
+    value.hashtags.every(isString) &&
+    (value.copySource === "ai" || value.copySource === "cleaned_fallback" || value.copySource === "user_edited") &&
+    isTaskStatus(value.status) &&
+    isOptionalString(value.scheduledAt) &&
+    isOptionalString(value.dueNotifiedAt) &&
+    isOptionalString(value.publishedAt) &&
+    isOptionalString(value.lastError) &&
+    isPositiveInteger(value.contentRevision) &&
+    (value.autoPublish === undefined || isAutoPublish(value.autoPublish)) &&
+    isString(value.createdAt) &&
+    isString(value.updatedAt)
+  );
+}
+
+function isAutoPublish(value: unknown): value is PublishAutoPublish {
+  if (!isRecord(value)) return false;
+  return (
+    (value.status === "running" || value.status === "awaiting_code"
+      || value.status === "succeeded" || value.status === "failed") &&
+    isString(value.startedAt) &&
+    isString(value.attemptId) &&
+    (value.finishedAt === undefined || isString(value.finishedAt)) &&
+    (value.message === undefined || isString(value.message)) &&
+    // 「只填到草稿」的标记：老记录没有这个字段（缺省 = 不是草稿通路），所以是可选的。
+    (value.draftOnly === undefined || typeof value.draftOnly === "boolean") &&
+    isOptionalString(value.xhsDraftId) &&
+    isOptionalString(value.draftMediaId) &&
+    (value.outcomeUncertain === undefined || typeof value.outcomeUncertain === "boolean")
+  );
+}
+
+function isAuditEvent(value: unknown): value is PublishAuditEvent {
+  if (!isRecord(value)) return false;
+  return (
+    isString(value.id) &&
+    isString(value.packageId) &&
+    isOptionalString(value.taskId) &&
+    isString(value.action) &&
+    isActor(value.actor) &&
+    (value.fromStatus === undefined || isTaskStatus(value.fromStatus)) &&
+    (value.toStatus === undefined || isTaskStatus(value.toStatus)) &&
+    isOptionalString(value.reason) &&
+    (value.metadata === undefined || isRecord(value.metadata)) &&
+    isString(value.createdAt)
+  );
+}
+
+function isTombstone(value: unknown, key: string): value is PublishingTombstone {
+  if (!isRecord(value)) return false;
+  return (
+    value.packageId === key &&
+    isString(value.sourceJobId) &&
+    isPositiveInteger(value.version) &&
+    Array.isArray(value.platforms) &&
+    value.platforms.every((item) => (
+      isRecord(item) && isPlatform(item.platform) && isTaskStatus(item.finalStatus)
+    )) &&
+    isString(value.createdAt) &&
+    isOptionalString(value.publishedAt) &&
+    isString(value.deletedAt) &&
+    isString(value.purgedAt) &&
+    isString(value.videoSha256) &&
+    Array.isArray(value.auditSummary) &&
+    value.auditSummary.every((item) => (
+      isRecord(item) && isString(item.action) && isActor(item.actor) && isString(item.createdAt)
+    ))
+  );
+}
+
+function isTaskStatus(value: unknown): value is PublishTaskStatus {
+  return (
+    value === "scheduled" ||
+    value === "ready" ||
+    value === "published" ||
+    value === "failed" ||
+    value === "cancelled"
+  );
+}
+
+/**
+ * 存档校验：读回索引时判定平台是否在册。
+ *
+ * 漏一个平台的后果是**静默的**：该平台的任务在读取时被丢掉，而不是报错。
+ * 因此导出它，让守卫用例对每一个在册平台都断言一次（见 `publishing-platforms.test.ts`）。
+ */
+export function isPlatform(value: unknown): value is PublishTask["platform"] {
+  return (
+    value === "douyin" ||
+    value === "xiaohongshu" ||
+    value === "wechat_channels" ||
+    value === "bilibili" ||
+    value === "wechat_mp" ||
+    value === "toutiao"
+  );
+}

@@ -1,0 +1,1376 @@
+import assert from "node:assert/strict";
+import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+import { LocalStorage } from "./storage.js";
+import { SYSTEM_ACTOR } from "./local-users.js";
+import type {
+  ActorSnapshot,
+  DeliveryPackage,
+  PublishTask,
+  PublishTaskStatus,
+  PublishingIndex,
+} from "../types.js";
+import { PublishingError, PublishingStore, packagePreviewRevision } from "./publishing-store.js";
+
+const ACTOR: ActorSnapshot = {
+  userId: "publisher-1",
+  displayName: "发布员",
+  role: "publisher",
+};
+const ADMIN: ActorSnapshot = {
+  userId: "admin-1",
+  displayName: "管理员",
+  role: "admin",
+};
+const NOW = "2026-08-10T08:00:00.000Z";
+
+async function fixture(now = new Date("2026-08-10T08:00:00.000Z")) {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-"));
+  const storage = new LocalStorage(root);
+  const store = new PublishingStore(storage, () => new Date(now));
+  await store.init();
+  return { root, storage, store };
+}
+
+function packageRecord(overrides: Partial<DeliveryPackage> = {}): DeliveryPackage {
+  return {
+    id: "package-1",
+    sourceJobId: "job-1",
+    version: 1,
+    state: "active",
+    title: "测试作品",
+    packagePath: "/tmp/publishing/job-1/v1-package-1",
+    videoPath: "/tmp/publishing/job-1/v1-package-1/video.mp4",
+    videoSha256: "sha256",
+    videoSize: 1024,
+    videoMethod: "clone",
+    assetHealth: "healthy",
+    createdBy: ACTOR,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  };
+}
+
+function taskRecord(
+  status: PublishTaskStatus = "ready",
+  overrides: Partial<PublishTask> = {}
+): PublishTask {
+  return {
+    id: "task-1",
+    packageId: "package-1",
+    platform: "douyin",
+    title: "标题",
+    description: "正文",
+    hashtags: ["AI"],
+    copySource: "ai",
+    status,
+    contentRevision: 1,
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  };
+}
+
+function seededIndex(
+  packages: DeliveryPackage[],
+  tasks: PublishTask[],
+  revision = 2
+): PublishingIndex {
+  return {
+    schemaVersion: 1,
+    revision,
+    nextVersionBySource: { "job-1": 2 },
+    packages: Object.fromEntries(packages.map((item) => [item.id, item])),
+    tasks: Object.fromEntries(tasks.map((item) => [item.id, item])),
+    audit: [],
+    tombstones: {},
+  };
+}
+
+async function seededFixture(status: PublishTaskStatus = "ready") {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-seeded-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([packageRecord()], [taskRecord(status)])
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  return {
+    root,
+    storage,
+    store,
+    readIndexBytes: () => readFile(path.join(root, "cache", "publishing-index.json")),
+  };
+}
+
+/** 任意包/任务集合的夹具（组合闸门用例需要「图文包 + 头条任务」这种错配）。 */
+async function seededCustomFixture(packages: DeliveryPackage[], tasks: PublishTask[]) {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-custom-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic("cache/publishing-index.json", seededIndex(packages, tasks));
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  return {
+    root,
+    storage,
+    store,
+    readIndexBytes: () => readFile(path.join(root, "cache", "publishing-index.json")),
+  };
+}
+
+test("allocates unique monotonically increasing versions for one source", async () => {
+  const { store } = await fixture();
+
+  const versions = await Promise.all(
+    Array.from({ length: 8 }, () => store.reserveVersion("job-1"))
+  );
+
+  assert.deepEqual([...versions].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal((await store.snapshot()).nextVersionBySource["job-1"], 9);
+});
+
+test("coordinates concurrent stores that share one canonical index path", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-shared-"));
+  const alias = `${root}-alias`;
+  await symlink(root, alias, "dir");
+  const first = new PublishingStore(new LocalStorage(root), () => new Date(NOW));
+  const second = new PublishingStore(new LocalStorage(alias), () => new Date(NOW));
+  await Promise.all([first.init(), second.init()]);
+
+  const versions = await Promise.all([
+    first.reserveVersion("job-1", ACTOR),
+    second.reserveVersion("job-1", ADMIN),
+  ]);
+
+  assert.deepEqual([...versions].sort((a, b) => a - b), [1, 2]);
+  const firstSnapshot = await first.snapshot();
+  const secondSnapshot = await second.snapshot();
+  const persisted = await new LocalStorage(root).readJson<PublishingIndex>(
+    "cache/publishing-index.json"
+  );
+  assert.equal(firstSnapshot.revision, 2);
+  assert.equal(firstSnapshot.nextVersionBySource["job-1"], 3);
+  assert.deepEqual(secondSnapshot, firstSnapshot);
+  assert.deepEqual(persisted, firstSnapshot);
+  assert.deepEqual(firstSnapshot.audit.map((event) => event.actor), [ACTOR, ADMIN]);
+  assert.deepEqual(firstSnapshot.audit.map((event) => ({
+    action: event.action,
+    metadata: event.metadata,
+    fromStatus: event.fromStatus,
+    toStatus: event.toStatus,
+  })), [
+    {
+      action: "source.reserve_version",
+      metadata: { sourceJobId: "job-1", version: 1 },
+      fromStatus: undefined,
+      toStatus: undefined,
+    },
+    {
+      action: "source.reserve_version",
+      metadata: { sourceJobId: "job-1", version: 2 },
+      fromStatus: undefined,
+      toStatus: undefined,
+    },
+  ]);
+});
+
+test("changes status and appends actor audit in one persisted revision", async () => {
+  const { store, storage } = await seededFixture("ready");
+
+  await store.markPublished("task-1", ACTOR, NOW);
+
+  const index = await store.snapshot();
+  const persisted = await storage.readJson<PublishingIndex>("cache/publishing-index.json");
+  assert.equal(index.revision, 3);
+  assert.equal(index.tasks["task-1"].status, "published");
+  assert.equal(index.tasks["task-1"].publishedAt, NOW);
+  assert.equal(index.audit.at(-1)?.action, "task.mark_published");
+  assert.deepEqual(index.audit.at(-1)?.actor, ACTOR);
+  assert.deepEqual(persisted, index);
+});
+
+test("rejects published to failed without writing", async () => {
+  const { store, readIndexBytes } = await seededFixture("published");
+  const before = await readIndexBytes();
+
+  await assert.rejects(
+    () => store.recordFailure("task-1", "平台拒绝", ACTOR),
+    (error: PublishingError) => error.code === "publish_invalid_transition"
+  );
+
+  assert.deepEqual(await readIndexBytes(), before);
+});
+
+test("rejects a stale content revision without overwriting content", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-revision-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([packageRecord()], [taskRecord("ready", { contentRevision: 2 })], 7)
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  const indexPath = path.join(root, "cache", "publishing-index.json");
+  const before = await readFile(indexPath);
+
+  await assert.rejects(
+    () => store.updateContent("task-1", {
+      title: "旧客户端标题",
+      description: "旧客户端正文",
+      hashtags: ["旧标签"],
+      expectedRevision: 1,
+    }, ACTOR),
+    (error: PublishingError) => error.code === "publish_revision_conflict"
+  );
+
+  assert.deepEqual(await readFile(indexPath), before);
+  assert.equal((await store.getTask("task-1"))?.title, "标题");
+});
+
+test("records an action error without changing task status or content revision", async () => {
+  const { store, storage } = await seededFixture("ready");
+  const before = await store.getTask("task-1");
+
+  await store.recordActionError(
+    "task-1",
+    "open_platform",
+    "无法打开创作平台",
+    ACTOR
+  );
+
+  const after = await store.getTask("task-1");
+  const persisted = await storage.readJson<PublishingIndex>("cache/publishing-index.json");
+  assert.equal(after?.status, before?.status);
+  assert.equal(after?.contentRevision, before?.contentRevision);
+  assert.equal(persisted.revision, 3);
+  assert.deepEqual(persisted.audit.at(-1), {
+    id: persisted.audit.at(-1)?.id,
+    packageId: "package-1",
+    taskId: "task-1",
+    action: "task.action_error",
+    actor: ACTOR,
+    reason: "无法打开创作平台",
+    metadata: { action: "open_platform" },
+    createdAt: NOW,
+  });
+});
+
+test("processes only newly due tasks from active packages with the system actor", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-due-"));
+  const storage = new LocalStorage(root);
+  const activePackage = packageRecord();
+  const notifiedPackage = packageRecord({ id: "package-2", version: 2 });
+  const trashedPackage = packageRecord({
+    id: "package-3",
+    version: 3,
+    state: "trashed",
+    deletedAt: "2026-08-01T00:00:00.000Z",
+    purgeAt: "2026-08-31T00:00:00.000Z",
+  });
+  const dueAt = "2026-08-10T07:55:00.000Z";
+  const due = taskRecord("scheduled", { scheduledAt: dueAt });
+  const notified = taskRecord("scheduled", {
+    id: "task-2",
+    packageId: "package-2",
+    scheduledAt: dueAt,
+    dueNotifiedAt: "2026-08-10T07:56:00.000Z",
+  });
+  const trashed = taskRecord("scheduled", {
+    id: "task-3",
+    packageId: "package-3",
+    scheduledAt: dueAt,
+  });
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex(
+      [activePackage, notifiedPackage, trashedPackage],
+      [due, notified, trashed]
+    )
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+
+  const notifications = await store.processDue();
+  const index = await store.snapshot();
+
+  assert.deepEqual(notifications, [{
+    taskId: "task-1",
+    packageId: "package-1",
+    platform: "douyin",
+    platformLabel: "抖音",
+    title: "标题",
+    scheduledAt: dueAt,
+    becameReadyAt: NOW,
+    overdueMs: 300_000,
+  }]);
+  assert.equal(index.tasks["task-1"].status, "ready");
+  assert.equal(index.tasks["task-1"].dueNotifiedAt, NOW);
+  assert.equal(index.tasks["task-2"].status, "scheduled");
+  assert.equal(index.tasks["task-3"].status, "scheduled");
+  assert.deepEqual(index.audit.at(-1)?.actor, SYSTEM_ACTOR);
+  assert.equal(index.audit.at(-1)?.action, "task.due");
+  const beforeNoop = await readFile(path.join(root, "cache", "publishing-index.json"));
+  assert.deepEqual(await store.processDue(), []);
+  assert.deepEqual(
+    await readFile(path.join(root, "cache", "publishing-index.json")),
+    beforeNoop
+  );
+});
+
+test("preserves task states in trash and catches up overdue tasks on restore", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-trash-"));
+  const storage = new LocalStorage(root);
+  const scheduled = taskRecord("scheduled", {
+    scheduledAt: "2026-08-10T07:55:00.000Z",
+  });
+  const published = taskRecord("published", {
+    id: "task-2",
+    publishedAt: "2026-08-09T08:00:00.000Z",
+  });
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([packageRecord()], [scheduled, published])
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+
+  const trashed = await store.trashPackage("package-1", ACTOR);
+  const index = await store.snapshot();
+
+  assert.equal(trashed.state, "trashed");
+  assert.equal(trashed.deletedAt, NOW);
+  assert.equal(trashed.purgeAt, "2026-09-09T08:00:00.000Z");
+  assert.equal(index.tasks["task-1"].status, "scheduled");
+  assert.equal(index.tasks["task-2"].status, "published");
+  assert.equal(index.audit.at(-1)?.action, "package.trash");
+  assert.deepEqual(index.audit.at(-1)?.actor, ACTOR);
+  assert.deepEqual(index.audit.at(-1)?.metadata, {
+    fromState: "active",
+    toState: "trashed",
+  });
+
+  const restored = await store.restorePackage("package-1", ACTOR);
+  assert.equal(restored.package.state, "active");
+  assert.equal(restored.package.deletedAt, undefined);
+  assert.equal(restored.package.purgeAt, undefined);
+  assert.deepEqual(restored.notifications, [{
+    taskId: "task-1",
+    packageId: "package-1",
+    platform: "douyin",
+    platformLabel: "抖音",
+    title: "标题",
+    scheduledAt: "2026-08-10T07:55:00.000Z",
+    becameReadyAt: NOW,
+    overdueMs: 300_000,
+  }]);
+  const restoredIndex = await store.snapshot();
+  assert.equal(restoredIndex.tasks["task-1"].status, "ready");
+  assert.equal(restoredIndex.tasks["task-1"].dueNotifiedAt, NOW);
+  assert.equal(restoredIndex.tasks["task-2"].status, "published");
+  assert.deepEqual(restoredIndex.audit.map((event) => event.action), [
+    "package.trash",
+    "package.restore",
+    "task.due",
+  ]);
+  assert.deepEqual(restoredIndex.audit.at(-1)?.actor, SYSTEM_ACTOR);
+  assert.deepEqual(
+    restoredIndex.audit.find((event) => event.action === "package.restore")?.metadata,
+    { fromState: "trashed", toState: "active" }
+  );
+});
+
+test("rejects restoring expired trash without writing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-expired-restore-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([
+      packageRecord({
+        state: "trashed",
+        deletedAt: "2026-07-01T08:00:00.000Z",
+        purgeAt: "2026-08-10T08:00:00.000Z",
+      }),
+    ], [taskRecord("scheduled", { scheduledAt: "2026-08-10T07:55:00.000Z" })])
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  const indexPath = path.join(root, "cache", "publishing-index.json");
+  const before = await readFile(indexPath);
+
+  await assert.rejects(
+    () => store.restorePackage("package-1", ACTOR),
+    (error: PublishingError) => (
+      error.code === "publish_invalid_transition"
+      && error.details?.reason === "trash_expired"
+    )
+  );
+
+  assert.deepEqual(await readFile(indexPath), before);
+});
+
+test("uses the transaction clock after a queued restore starts executing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-queued-restore-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([
+      packageRecord({
+        state: "trashed",
+        deletedAt: "2026-08-01T08:00:00.000Z",
+        purgeAt: "2026-08-31T08:00:00.000Z",
+      }),
+    ], [taskRecord("scheduled", { scheduledAt: "2026-08-10T08:00:00.000Z" })])
+  );
+  let nowMs = Date.parse("2026-08-10T07:59:59.000Z");
+  const store = new PublishingStore(storage, () => new Date(nowMs));
+  await store.init();
+
+  let releaseWrite!: () => void;
+  let writeStarted!: () => void;
+  const release = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  const started = new Promise<void>((resolve) => { writeStarted = resolve; });
+  const writeJsonAtomic = storage.writeJsonAtomic.bind(storage);
+  let blockNextWrite = true;
+  storage.writeJsonAtomic = async (relativePath, data) => {
+    if (blockNextWrite) {
+      blockNextWrite = false;
+      writeStarted();
+      await release;
+    }
+    return writeJsonAtomic(relativePath, data);
+  };
+
+  const precedingMutation = store.recordPurgeFailure(
+    "package-1",
+    "前置写入",
+    SYSTEM_ACTOR
+  );
+  await started;
+  const restore = store.restorePackage("package-1", ACTOR);
+  nowMs = Date.parse("2026-08-10T08:00:01.000Z");
+  releaseWrite();
+  await precedingMutation;
+
+  const result = await restore;
+  const index = await store.snapshot();
+  assert.equal(result.package.updatedAt, "2026-08-10T08:00:01.000Z");
+  assert.deepEqual(result.notifications, [{
+    taskId: "task-1",
+    packageId: "package-1",
+    platform: "douyin",
+    platformLabel: "抖音",
+    title: "标题",
+    scheduledAt: "2026-08-10T08:00:00.000Z",
+    becameReadyAt: "2026-08-10T08:00:01.000Z",
+    overdueMs: 1_000,
+  }]);
+  assert.equal(index.tasks["task-1"].status, "ready");
+  assert.equal(index.tasks["task-1"].updatedAt, "2026-08-10T08:00:01.000Z");
+  assert.equal(index.audit.at(-2)?.createdAt, "2026-08-10T08:00:01.000Z");
+  assert.equal(index.audit.at(-1)?.createdAt, "2026-08-10T08:00:01.000Z");
+});
+
+test("preserves a malformed index and protects every subsequent mutation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-corrupt-"));
+  const indexPath = path.join(root, "cache", "publishing-index.json");
+  await mkdir(path.dirname(indexPath), { recursive: true });
+  const malformed = Buffer.from('{"schemaVersion":1,"packages":');
+  await writeFile(indexPath, malformed);
+  const store = new PublishingStore(new LocalStorage(root), () => new Date(NOW));
+
+  await store.init();
+
+  assert.deepEqual(await readFile(indexPath), malformed);
+  assert.deepEqual(await store.snapshot(), {
+    schemaVersion: 1,
+    revision: 0,
+    nextVersionBySource: {},
+    packages: {},
+    tasks: {},
+    audit: [],
+    tombstones: {},
+  });
+  for (const mutation of [
+    () => store.reserveVersion("job-1"),
+    () => store.recordActionError("task-1", "open_platform", "失败", ACTOR),
+    () => store.trashPackage("package-1", ACTOR),
+  ]) {
+    await assert.rejects(
+      mutation,
+      (error: PublishingError) => error.code === "publish_index_corrupt"
+    );
+    assert.deepEqual(await readFile(indexPath), malformed);
+  }
+});
+
+test("treats structurally malformed JSON as a read-only corrupt index", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-invalid-shape-"));
+  const storage = new LocalStorage(root);
+  const malformed = {
+    schemaVersion: 1,
+    revision: 2,
+    nextVersionBySource: { "job-1": "two" },
+    packages: {},
+    tasks: {},
+    audit: [],
+    tombstones: {},
+  };
+  await storage.writeJsonAtomic("cache/publishing-index.json", malformed);
+  const indexPath = path.join(root, "cache", "publishing-index.json");
+  const before = await readFile(indexPath);
+  const store = new PublishingStore(storage, () => new Date(NOW));
+
+  await store.init();
+
+  await assert.rejects(
+    () => store.reserveVersion("job-1"),
+    (error: PublishingError) => error.code === "publish_index_corrupt"
+  );
+  assert.deepEqual(await readFile(indexPath), before);
+});
+
+test("does not publish a default in-memory index before its atomic write succeeds", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-init-failure-"));
+  const failingStore = new PublishingStore(new LocalStorage(root, {
+    rename: async () => {
+      throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+    },
+  }), () => new Date(NOW));
+
+  await assert.rejects(() => failingStore.init(), /disk full/);
+  await assert.rejects(
+    () => failingStore.snapshot(),
+    (error: PublishingError) => error.code === "publish_index_corrupt"
+  );
+  await assert.rejects(
+    () => access(path.join(root, "cache", "publishing-index.json")),
+    (error: NodeJS.ErrnoException) => error.code === "ENOENT"
+  );
+
+  const recoveredStore = new PublishingStore(new LocalStorage(root), () => new Date(NOW));
+  await recoveredStore.init();
+  assert.deepEqual(await recoveredStore.snapshot(), {
+    schemaVersion: 1,
+    revision: 0,
+    nextVersionBySource: {},
+    packages: {},
+    tasks: {},
+    audit: [],
+    tombstones: {},
+  });
+});
+
+test("implements every allowed task status transition", async (context) => {
+  const future = "2026-08-11T08:00:00.000Z";
+  const cases: Array<{
+    name: string;
+    from: PublishTaskStatus;
+    to: PublishTaskStatus;
+    run: (store: PublishingStore) => Promise<PublishTask>;
+  }> = [
+    { name: "scheduled -> ready", from: "scheduled", to: "ready", run: (store) => store.updateSchedule("task-1", null, ACTOR) },
+    { name: "scheduled -> cancelled", from: "scheduled", to: "cancelled", run: (store) => store.cancel("task-1", ACTOR) },
+    { name: "scheduled -> failed", from: "scheduled", to: "failed", run: (store) => store.recordFailure("task-1", "准备失败", ACTOR) },
+    { name: "ready -> scheduled", from: "ready", to: "scheduled", run: (store) => store.updateSchedule("task-1", future, ACTOR) },
+    { name: "ready -> published", from: "ready", to: "published", run: (store) => store.markPublished("task-1", ACTOR) },
+    { name: "ready -> failed", from: "ready", to: "failed", run: (store) => store.recordFailure("task-1", "发布失败", ACTOR) },
+    { name: "ready -> cancelled", from: "ready", to: "cancelled", run: (store) => store.cancel("task-1", ACTOR) },
+    { name: "failed -> ready", from: "failed", to: "ready", run: (store) => store.restoreTask("task-1", null, ACTOR) },
+    { name: "failed -> scheduled", from: "failed", to: "scheduled", run: (store) => store.restoreTask("task-1", future, ACTOR) },
+    { name: "failed -> cancelled", from: "failed", to: "cancelled", run: (store) => store.cancel("task-1", ACTOR) },
+    { name: "cancelled -> ready", from: "cancelled", to: "ready", run: (store) => store.restoreTask("task-1", null, ACTOR) },
+    { name: "cancelled -> scheduled", from: "cancelled", to: "scheduled", run: (store) => store.restoreTask("task-1", future, ACTOR) },
+    { name: "published -> ready", from: "published", to: "ready", run: (store) => store.withdraw("task-1", "本地记录有误", ADMIN) },
+  ];
+
+  for (const item of cases) {
+    await context.test(item.name, async () => {
+      const root = await mkdtemp(path.join(tmpdir(), "publishing-store-transition-"));
+      const storage = new LocalStorage(root);
+      await storage.writeJsonAtomic(
+        "cache/publishing-index.json",
+        seededIndex([packageRecord()], [taskRecord(item.from, {
+          scheduledAt: item.from === "scheduled" ? future : undefined,
+          dueNotifiedAt: item.from === "ready" ? "2026-08-09T08:00:00.000Z" : undefined,
+          publishedAt: item.from === "published" ? "2026-08-09T08:00:00.000Z" : undefined,
+          lastError: item.from === "failed" ? "旧错误" : undefined,
+        })])
+      );
+      const store = new PublishingStore(storage, () => new Date(NOW));
+      await store.init();
+
+      const task = await item.run(store);
+      const audit = (await store.snapshot()).audit.at(-1);
+
+      assert.equal(task.status, item.to);
+      assert.equal(audit?.fromStatus, item.from);
+      assert.equal(audit?.toStatus, item.to);
+      assert.ok(audit?.actor);
+      if (item.to === "scheduled") assert.equal(task.dueNotifiedAt, undefined);
+    });
+  }
+});
+
+test("commits a reserved package with an immutable actor snapshot", async () => {
+  const { store } = await fixture();
+  const version = await store.reserveVersion("job-1");
+  const fakeActor: ActorSnapshot = { userId: "fake", displayName: "伪造", role: "publisher" };
+  const commitActor: ActorSnapshot = { ...ACTOR };
+
+  const detail = await store.commitPackage({
+    package: packageRecord({ version, createdBy: fakeActor }),
+    tasks: [taskRecord()],
+  }, commitActor);
+  commitActor.displayName = "已改名";
+
+  assert.equal(detail.package.version, 1);
+  assert.deepEqual(detail.package.createdBy, {
+    userId: "publisher-1",
+    displayName: "发布员",
+    role: "publisher",
+  });
+  assert.equal(detail.tasks.length, 1);
+  assert.equal(detail.audit.at(-1)?.action, "package.create");
+  assert.deepEqual(detail.audit.at(-1)?.actor, detail.package.createdBy);
+});
+
+test("rejects invalid initial package task states without writing", async () => {
+  const { root, store } = await fixture();
+  const version = await store.reserveVersion("job-1", ACTOR);
+  const indexPath = path.join(root, "cache", "publishing-index.json");
+  const before = await readFile(indexPath);
+  const invalidTasks = [
+    taskRecord("published", { publishedAt: NOW }),
+    taskRecord("scheduled"),
+    taskRecord("scheduled", { scheduledAt: "2026-08-10T07:59:59.999Z" }),
+    taskRecord("ready", {
+      publishedAt: "2026-08-09T08:00:00.000Z",
+      dueNotifiedAt: "2026-08-09T07:00:00.000Z",
+      lastError: "旧错误",
+    }),
+  ];
+
+  for (const task of invalidTasks) {
+    await assert.rejects(
+      () => store.commitPackage({
+        package: packageRecord({ version }),
+        tasks: [task],
+      }, ACTOR),
+      (error: PublishingError) => error.code === "publish_validation_failed"
+    );
+    assert.deepEqual(await readFile(indexPath), before);
+  }
+});
+
+test("rejects present empty-string task traces without writing", async () => {
+  const { root, store } = await fixture();
+  const version = await store.reserveVersion("job-1", ACTOR);
+  const indexPath = path.join(root, "cache", "publishing-index.json");
+  const before = await readFile(indexPath);
+  const invalidTasks = [
+    taskRecord("ready", { publishedAt: "" }),
+    taskRecord("ready", { dueNotifiedAt: "" }),
+    taskRecord("ready", { lastError: "" }),
+    taskRecord("ready", { scheduledAt: "" }),
+  ];
+
+  for (const task of invalidTasks) {
+    await assert.rejects(
+      () => store.commitPackage({
+        package: packageRecord({ version }),
+        tasks: [task],
+      }, ACTOR),
+      (error: PublishingError) => error.code === "publish_validation_failed"
+    );
+    assert.deepEqual(await readFile(indexPath), before);
+  }
+});
+
+test("rejects a duplicate source version without writing", async () => {
+  const { store, readIndexBytes } = await seededFixture();
+  const before = await readIndexBytes();
+
+  await assert.rejects(
+    () => store.commitPackage({
+      package: packageRecord({ id: "package-duplicate-version" }),
+      tasks: [taskRecord("ready", {
+        id: "task-duplicate-version",
+        packageId: "package-duplicate-version",
+      })],
+    }, ACTOR),
+    (error: PublishingError) => error.code === "publish_revision_conflict"
+  );
+
+  assert.deepEqual(await readIndexBytes(), before);
+});
+
+test("updates asset health without changing task status and blocks broken publishing", async () => {
+  const { store, readIndexBytes } = await seededFixture("ready");
+
+  const packageResult = await store.setAssetHealth("package-1", "broken_video", ACTOR);
+  assert.equal(packageResult.assetHealth, "broken_video");
+  assert.equal((await store.getTask("task-1"))?.status, "ready");
+  const healthAudit = (await store.snapshot()).audit.at(-1);
+  assert.deepEqual(healthAudit?.metadata, {
+    fromState: "healthy",
+    toState: "broken_video",
+  });
+  assert.equal(healthAudit?.fromStatus, undefined);
+  assert.equal(healthAudit?.toStatus, undefined);
+  const beforePublish = await readIndexBytes();
+  await assert.rejects(
+    () => store.markPublished("task-1", ACTOR),
+    (error: PublishingError) => error.code === "publish_asset_broken"
+  );
+  assert.deepEqual(await readIndexBytes(), beforePublish);
+});
+
+test("marks expired trash purged with a tombstone derived from current index data", async () => {
+  const purgedAt = "2026-09-10T08:00:00.000Z";
+  const deletedAt = "2026-08-12T08:00:00.000Z";
+  const publishedAt = "2026-08-11T08:00:00.000Z";
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-purge-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([
+      packageRecord({
+        state: "trashed",
+        deletedAt,
+        purgeAt: purgedAt,
+      }),
+    ], [taskRecord("published", { publishedAt })])
+  );
+  const store = new PublishingStore(storage, () => new Date(purgedAt));
+  await store.init();
+
+  const tombstone = await store.markPurged("package-1", SYSTEM_ACTOR);
+
+  const index = await store.snapshot();
+  assert.equal(index.packages["package-1"].state, "purged");
+  assert.equal(index.packages["package-1"].purgedAt, purgedAt);
+  assert.equal(index.tasks["task-1"], undefined);
+  assert.deepEqual(index.tombstones["package-1"], tombstone);
+  assert.deepEqual(tombstone, {
+    packageId: "package-1",
+    sourceJobId: "job-1",
+    version: 1,
+    platforms: [{ platform: "douyin", finalStatus: "published" }],
+    createdAt: NOW,
+    publishedAt,
+    deletedAt,
+    purgedAt,
+    videoSha256: "sha256",
+    auditSummary: [{
+      action: "package.purge",
+      actor: SYSTEM_ACTOR,
+      createdAt: purgedAt,
+    }],
+  });
+  assert.equal(index.audit.at(-1)?.action, "package.purge");
+  assert.deepEqual(index.audit.at(-1)?.actor, SYSTEM_ACTOR);
+  assert.deepEqual(index.audit.at(-1)?.metadata, {
+    fromState: "trashed",
+    toState: "purged",
+  });
+  assert.equal(index.audit.at(-1)?.fromStatus, undefined);
+  assert.equal(index.audit.at(-1)?.toStatus, undefined);
+});
+
+test("rejects purging trash before purgeAt without writing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-early-purge-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([
+      packageRecord({
+        state: "trashed",
+        deletedAt: "2026-08-10T07:00:00.000Z",
+        purgeAt: "2026-08-10T09:00:00.000Z",
+      }),
+    ], [taskRecord("ready")])
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  const indexPath = path.join(root, "cache", "publishing-index.json");
+  const before = await readFile(indexPath);
+
+  await assert.rejects(
+    () => store.markPurged("package-1", SYSTEM_ACTOR),
+    (error: PublishingError) => error.code === "publish_invalid_transition"
+  );
+
+  assert.deepEqual(await readFile(indexPath), before);
+});
+
+test("records purge failures without claiming the package was purged", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-purge-failure-"));
+  const storage = new LocalStorage(root);
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([packageRecord({ state: "trashed", deletedAt: NOW, purgeAt: NOW })], [taskRecord()])
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+
+  await store.recordPurgeFailure("package-1", "文件被占用", SYSTEM_ACTOR);
+
+  const index = await store.snapshot();
+  assert.equal(index.packages["package-1"].state, "trashed");
+  assert.equal(index.audit.at(-1)?.action, "package.purge_failed");
+  assert.equal(index.audit.at(-1)?.reason, "文件被占用");
+});
+
+test("lists packages using action, state, asset and field filters", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-list-"));
+  const storage = new LocalStorage(root);
+  const packages = [
+    packageRecord({ id: "package-ready", title: "夏日 AI", createdAt: "2026-08-10T04:00:00.000Z" }),
+    packageRecord({ id: "package-broken", sourceJobId: "job-2", version: 2, title: "旅行", assetHealth: "broken_video", createdBy: ADMIN, createdAt: "2026-08-10T05:00:00.000Z" }),
+    packageRecord({ id: "package-published", sourceJobId: "job-3", version: 3, title: "美食", createdAt: "2026-08-10T06:00:00.000Z" }),
+    packageRecord({ id: "package-trash", sourceJobId: "job-4", version: 4, title: "旧稿", state: "trashed", deletedAt: NOW, purgeAt: "2026-09-09T08:00:00.000Z", createdAt: "2026-08-10T07:00:00.000Z" }),
+  ];
+  const tasks = [
+    taskRecord("ready", { id: "task-ready", packageId: "package-ready", title: "AI 标题" }),
+    taskRecord("scheduled", { id: "task-broken", packageId: "package-broken", platform: "xiaohongshu", scheduledAt: "2026-08-11T08:00:00.000Z" }),
+    taskRecord("published", { id: "task-published", packageId: "package-published", platform: "bilibili", publishedAt: NOW }),
+    taskRecord("failed", { id: "task-trash", packageId: "package-trash", lastError: "失败" }),
+  ];
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex(packages, tasks)
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  const ids = async (filters: Parameters<PublishingStore["list"]>[0]) =>
+    (await store.list(filters)).map((detail) => detail.package.id);
+
+  assert.deepEqual(await ids({ status: "action" }), ["package-broken", "package-ready"]);
+  assert.deepEqual(await ids({ status: "all" }), ["package-published", "package-broken", "package-ready"]);
+  assert.deepEqual(await ids({ status: "published" }), ["package-published"]);
+  assert.deepEqual(await ids({ status: "broken" }), ["package-broken"]);
+  assert.deepEqual(await ids({ status: "trash" }), ["package-trash"]);
+  assert.deepEqual(await ids({ platform: "xiaohongshu" }), ["package-broken"]);
+  assert.deepEqual(await ids({ sourceJobId: "job-2", version: 2, createdBy: "admin-1" }), ["package-broken"]);
+  assert.deepEqual(await ids({ search: "ai 标题" }), ["package-ready"]);
+});
+
+// 发布中心的「渠道」分栏靠这一个过滤字段（渠道 = 内容类型的界面投影）：
+// 抖音图文 = note、今日头条文章 = article、视频人工交付 = video。
+// 关键回归点：**不传时必须三种都回**（既有界面与用例默认不带这个参数）。
+test("filters the list by content type, and stays unfiltered when it is omitted", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-channel-"));
+  const storage = new LocalStorage(root);
+  const packages = [
+    packageRecord({ id: "package-video", title: "视频交付", createdAt: "2026-08-10T04:00:00.000Z" }),
+    notePackageRecord({ id: "package-note", sourceJobId: "job-2", version: 2, title: "抖音图文", createdAt: "2026-08-10T05:00:00.000Z" }),
+    articlePackageRecord({ id: "package-article", sourceJobId: "job-3", version: 3, title: "头条文章", createdAt: "2026-08-10T06:00:00.000Z" }),
+    notePackageRecord({ id: "package-note-trash", sourceJobId: "job-4", version: 4, title: "旧图文", state: "trashed", deletedAt: NOW, purgeAt: "2026-09-09T08:00:00.000Z", createdAt: "2026-08-10T07:00:00.000Z" }),
+  ];
+  const tasks = [
+    taskRecord("ready", { id: "task-video", packageId: "package-video" }),
+    taskRecord("ready", { id: "task-note", packageId: "package-note" }),
+    taskRecord("ready", { id: "task-article", packageId: "package-article", platform: "toutiao" }),
+    taskRecord("failed", { id: "task-note-trash", packageId: "package-note-trash" }),
+  ];
+  await storage.writeJsonAtomic("cache/publishing-index.json", seededIndex(packages, tasks));
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  const ids = async (filters: Parameters<PublishingStore["list"]>[0]) =>
+    (await store.list(filters)).map((detail) => detail.package.id);
+
+  assert.deepEqual(await ids({ status: "all", contentType: "note" }), ["package-note"]);
+  assert.deepEqual(await ids({ status: "all", contentType: "article" }), ["package-article"]);
+  assert.deepEqual(await ids({ status: "all", contentType: "video" }), ["package-video"]);
+  // 垃圾桶是**渠道内**的视图：图文垃圾桶里只该有被删的图文包。
+  assert.deepEqual(await ids({ status: "trash", contentType: "note" }), ["package-note-trash"]);
+  assert.deepEqual(await ids({ status: "trash", contentType: "article" }), []);
+  // 回归：不带这个参数时三种都回（顺序按 createdAt 倒序）。
+  assert.deepEqual(
+    await ids({ status: "all" }),
+    ["package-article", "package-note", "package-video"],
+  );
+});
+
+// ─── ② 抖音图文自动发布：包级 previewRevision 与 autoPublish 子记录 ───────────
+
+const NOTE_COPY = { title: "图文标题", description: "图文正文", hashtags: ["内容创作"] };
+
+// ── 文章包（今日头条）────────────────────────────────────────────────────────
+const ARTICLE_HTML_HASH = "d".repeat(64);
+
+function articlePackageRecord(overrides: Partial<DeliveryPackage> = {}): DeliveryPackage {
+  return packageRecord({
+    contentType: "article",
+    articleCopy: { title: "头条文章标题", htmlSha256: ARTICLE_HTML_HASH },
+    coverPath: "/tmp/publishing/job-1/v1-package-1/cover.jpg",
+    toutiaoOptions: { firstPublish: false, declarations: [], crossPostWeitoutiao: false },
+    // article 包的 video* 字段与 note 包同口径：videoSha256 承载图片清单哈希。
+    videoSha256: NOTE_IMAGE_HASH,
+    videoSize: 2048,
+    videoMethod: "copy",
+    ...overrides,
+  });
+}
+const NOTE_IMAGE_HASH = "b".repeat(64);
+
+function notePackageRecord(overrides: Partial<DeliveryPackage> = {}): DeliveryPackage {
+  return packageRecord({
+    contentType: "note",
+    imagePaths: ["images/01.png", "images/02.png"],
+    noteCopy: { ...NOTE_COPY, hashtags: [...NOTE_COPY.hashtags] },
+    // note 包的 video* 字段「不适用」，videoSha256 承载图片清单哈希。
+    videoSha256: NOTE_IMAGE_HASH,
+    videoSize: 2048,
+    videoMethod: "copy",
+    ...overrides,
+  });
+}
+
+async function seededNoteFixture(
+  overrides: { autoPublish?: PublishTask["autoPublish"]; startedAt?: string } = {},
+) {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-note-"));
+  const storage = new LocalStorage(root);
+  const task = taskRecord("ready", {
+    ...(overrides.autoPublish ? { autoPublish: overrides.autoPublish } : {}),
+  });
+  await storage.writeJsonAtomic(
+    "cache/publishing-index.json",
+    seededIndex([notePackageRecord()], [task])
+  );
+  const store = new PublishingStore(storage, () => new Date(NOW));
+  await store.init();
+  return {
+    root,
+    storage,
+    store,
+    taskId: task.id,
+    readIndexBytes: () => readFile(path.join(root, "cache", "publishing-index.json")),
+  };
+}
+
+function isPublishingError(code: string) {
+  return (error: unknown) => {
+    assert.ok(error instanceof PublishingError, `期望 PublishingError，实际 ${String(error)}`);
+    assert.equal(error.code, code);
+    return true;
+  };
+}
+
+test("package preview revision covers ordered note images, note copy, and task copy", () => {
+  const base = packagePreviewRevision(notePackageRecord(), [taskRecord()]);
+  assert.match(base, /^[0-9a-f]{64}$/u);
+  // 同输入同输出
+  assert.equal(packagePreviewRevision(notePackageRecord(), [taskRecord()]), base);
+  // 图片顺序参与指纹（发错顺序事后只能删稿重发）
+  assert.notEqual(
+    packagePreviewRevision(notePackageRecord({ imagePaths: ["images/02.png", "images/01.png"] }), [taskRecord()]),
+    base,
+  );
+  assert.notEqual(
+    packagePreviewRevision(notePackageRecord({ noteCopy: { ...NOTE_COPY, description: "改过的正文" } }), [taskRecord()]),
+    base,
+  );
+  assert.notEqual(
+    packagePreviewRevision(notePackageRecord(), [taskRecord("ready", { title: "改过的标题" })]),
+    base,
+  );
+  // 视频包覆盖成片哈希
+  assert.notEqual(
+    packagePreviewRevision(packageRecord(), [taskRecord()]),
+    packagePreviewRevision(packageRecord({ videoSha256: "c".repeat(64) }), [taskRecord()]),
+  );
+});
+
+test("reads the current package preview revision from the index", async () => {
+  const { store } = await seededFixture();
+
+  assert.equal(await store.previewRevision("package-1"), packagePreviewRevision(packageRecord(), [taskRecord()]));
+  assert.equal(await store.previewRevision("package-absent"), null);
+});
+
+test("beginAutoPublish refuses a video package without writing anything", async () => {
+  const { store, readIndexBytes } = await seededFixture();
+  const before = await readIndexBytes();
+
+  await assert.rejects(
+    store.beginAutoPublish("task-1", { previewRevision: "whatever", attemptId: "attempt-1" }, ACTOR),
+    isPublishingError("publish_not_a_note_package"),
+  );
+
+  assert.deepEqual(await readIndexBytes(), before);
+  assert.equal((await store.getTask("task-1"))!.autoPublish, undefined);
+});
+
+test("公众号草稿事务拒绝已取消/已发布及不确定或遗留运行记录，不受30分钟过期放行影响", async () => {
+  for (const status of ["cancelled", "published", "uncertain", "running"] as const) {
+    const root = await mkdtemp(path.join(tmpdir(), "wechat-store-"));
+    const storage = new LocalStorage(root);
+    const autoPublish = status === "uncertain" || status === "running"
+      ? { status: status === "running" ? "running" as const : "failed" as const, startedAt: "2020-01-01T00:00:00Z", attemptId: "old", outcomeUncertain: status === "uncertain" } : undefined;
+    const task = taskRecord(status === "cancelled" || status === "published" ? status : "ready", { platform: "wechat_mp", autoPublish });
+    await storage.writeJsonAtomic("cache/publishing-index.json", seededIndex([packageRecord({ contentType: "article" })], [task]));
+    const store = new PublishingStore(storage);
+    await store.init();
+    const revision = (await store.previewRevision("package-1"))!;
+    await assert.rejects(store.beginAutoPublish(task.id, { previewRevision: revision, attemptId: "new" }, ACTOR), isPublishingError("publish_invalid_transition"));
+  }
+});
+
+test("beginAutoPublish refuses a stale or missing preview revision without writing anything", async () => {
+  const { store, readIndexBytes, taskId } = await seededNoteFixture();
+  const before = await readIndexBytes();
+
+  await assert.rejects(
+    store.beginAutoPublish(taskId, { previewRevision: "stale-revision", attemptId: "attempt-1" }, ACTOR),
+    isPublishingError("publish_revision_conflict"),
+  );
+  await assert.rejects(
+    store.beginAutoPublish(taskId, { previewRevision: "", attemptId: "attempt-1" }, ACTOR),
+    isPublishingError("publish_revision_conflict"),
+  );
+
+  assert.deepEqual(await readIndexBytes(), before);
+  assert.equal((await store.getTask(taskId))!.autoPublish, undefined);
+});
+
+test("beginAutoPublish records a running attempt without changing the task status", async () => {
+  const { store, taskId } = await seededNoteFixture();
+  const revision = (await store.previewRevision("package-1"))!;
+
+  const task = await store.beginAutoPublish(taskId, { previewRevision: revision, attemptId: "attempt-1" }, ACTOR);
+
+  assert.equal(task.autoPublish?.status, "running");
+  assert.equal(task.autoPublish?.attemptId, "attempt-1");
+  assert.equal(task.autoPublish?.startedAt, NOW);
+  // 不新增 PublishTaskStatus 取值：任务状态原样不动
+  assert.equal(task.status, "ready");
+  const auditActions = (await store.snapshot()).audit.map((event) => event.action);
+  assert.deepEqual(auditActions, ["task.auto_publish_start"]);
+});
+
+test("a second autoPublish cannot start while one is running or waiting for a code", async () => {
+  const { store, taskId } = await seededNoteFixture();
+  const revision = (await store.previewRevision("package-1"))!;
+  await store.beginAutoPublish(taskId, { previewRevision: revision, attemptId: "attempt-1" }, ACTOR);
+
+  await assert.rejects(
+    store.beginAutoPublish(taskId, { previewRevision: revision, attemptId: "attempt-2" }, ACTOR),
+    isPublishingError("publish_auto_publish_in_progress"),
+  );
+
+  await store.updateAutoPublish(taskId, { status: "awaiting_code", message: "等待验证码" }, ACTOR);
+  await assert.rejects(
+    store.beginAutoPublish(taskId, { previewRevision: revision, attemptId: "attempt-3" }, ACTOR),
+    isPublishingError("publish_auto_publish_in_progress"),
+  );
+
+  // 始终只有一条记录，且仍是第一次的 attempt
+  const task = (await store.getTask(taskId))!;
+  assert.equal(task.autoPublish?.attemptId, "attempt-1");
+  assert.equal(task.autoPublish?.status, "awaiting_code");
+});
+
+test("a stale running attempt does not block the task forever", async () => {
+  // 进程被杀 / 应用崩溃会留下永远 running 的记录；超过阈值必须能重试，否则任务被永久锁死。
+  const staleStartedAt = new Date(new Date(NOW).getTime() - 60 * 60 * 1000).toISOString();
+  const { store, taskId } = await seededNoteFixture({
+    autoPublish: { status: "running", startedAt: staleStartedAt, attemptId: "dead-attempt" },
+  });
+  const revision = (await store.previewRevision("package-1"))!;
+
+  const task = await store.beginAutoPublish(taskId, { previewRevision: revision, attemptId: "attempt-new" }, ACTOR);
+
+  assert.equal(task.autoPublish?.attemptId, "attempt-new");
+  assert.equal(task.autoPublish?.status, "running");
+  assert.equal(task.autoPublish?.startedAt, NOW);
+
+  // 阈值之内的 running 仍然要拦住
+  const fresh = await seededNoteFixture({
+    autoPublish: { status: "running", startedAt: NOW, attemptId: "alive-attempt" },
+  });
+  await assert.rejects(
+    fresh.store.beginAutoPublish(fresh.taskId, { previewRevision: revision, attemptId: "attempt-x" }, ACTOR),
+    isPublishingError("publish_auto_publish_in_progress"),
+  );
+});
+
+test("autoPublish outcomes never write published and survive an index reload", async () => {
+  const { root, store, taskId } = await seededNoteFixture();
+  const revision = (await store.previewRevision("package-1"))!;
+  await store.beginAutoPublish(taskId, { previewRevision: revision, attemptId: "attempt-1" }, ACTOR);
+
+  await store.updateAutoPublish(taskId, { status: "awaiting_code", message: "等待短信验证码" }, ACTOR);
+  let task = (await store.getTask(taskId))!;
+  assert.equal(task.autoPublish?.status, "awaiting_code");
+  assert.equal(task.status, "ready");
+
+  // 退出码 0 只记「已提交」，绝不写 published
+  await store.updateAutoPublish(taskId, { status: "succeeded", message: "sau: 图文发布成功", finishedAt: NOW }, ACTOR);
+  task = (await store.getTask(taskId))!;
+  assert.equal(task.autoPublish?.status, "succeeded");
+  assert.equal(task.autoPublish?.message, "sau: 图文发布成功");
+  assert.equal(task.autoPublish?.finishedAt, NOW);
+  assert.equal(task.status, "ready");
+  assert.equal(task.publishedAt, undefined);
+
+  await store.updateAutoPublish(taskId, { status: "failed", message: "预检失败：登录态失效" }, ACTOR);
+  task = (await store.getTask(taskId))!;
+  assert.equal(task.autoPublish?.status, "failed");
+  assert.equal(task.status, "ready");
+
+  // 落库：新实例（重新校验索引）必须能读回 autoPublish，且从没写过 published
+  const reopened = new PublishingStore(new LocalStorage(root), () => new Date(NOW));
+  await reopened.init();
+  const persisted = (await reopened.getTask(taskId))!;
+  assert.equal(persisted.autoPublish?.status, "failed");
+  assert.equal(persisted.autoPublish?.attemptId, "attempt-1");
+  assert.equal(persisted.status, "ready");
+  assert.deepEqual(
+    (await reopened.snapshot()).audit.map((event) => event.action),
+    [
+      "task.auto_publish_start",
+      "task.auto_publish_awaiting_code",
+      "task.auto_publish_succeeded",
+      "task.auto_publish_failed",
+    ],
+  );
+});
+
+test("submitting a verification code requires an attempt that is actually waiting", async () => {
+  const { store, taskId } = await seededNoteFixture();
+  const revision = (await store.previewRevision("package-1"))!;
+
+  // 没有尝试时拒绝
+  await assert.rejects(
+    store.recordAutoPublishCode(taskId, ACTOR),
+    isPublishingError("publish_auto_publish_code_unexpected"),
+  );
+
+  await store.beginAutoPublish(taskId, { previewRevision: revision, attemptId: "attempt-1" }, ACTOR);
+  // running（尚未进入等待验证码）同样拒绝
+  await assert.rejects(
+    store.recordAutoPublishCode(taskId, ACTOR),
+    isPublishingError("publish_auto_publish_code_unexpected"),
+  );
+
+  await store.updateAutoPublish(taskId, { status: "awaiting_code" }, ACTOR);
+  const task = await store.recordAutoPublishCode(taskId, ACTOR);
+
+  assert.equal(task.autoPublish?.status, "awaiting_code");
+  assert.equal(task.status, "ready");
+  const audit = (await store.snapshot()).audit;
+  assert.equal(audit.at(-1)?.action, "task.auto_publish_code");
+  assert.equal(audit.at(-1)?.taskId, taskId);
+});
+
+// ─── 文章包的指纹与 (内容类型 × 平台) 闸门 ──────────────────────────────────
+
+test("article 指纹覆盖正文哈希、标题、封面与头条选项（少一样预览就能被绕过）", () => {
+  const tasks = [taskRecord("ready", { platform: "toutiao" })];
+  const base = packagePreviewRevision(articlePackageRecord(), tasks);
+  assert.match(base, /^[0-9a-f]{64}$/u);
+  assert.equal(packagePreviewRevision(articlePackageRecord(), tasks), base, "同输入同输出");
+
+  // 正文被改（article.html 的哈希变了）
+  assert.notEqual(
+    packagePreviewRevision(
+      articlePackageRecord({ articleCopy: { title: "头条文章标题", htmlSha256: "e".repeat(64) } }),
+      tasks,
+    ),
+    base,
+  );
+  // 标题被改（包级）
+  assert.notEqual(
+    packagePreviewRevision(
+      articlePackageRecord({ articleCopy: { title: "改过的标题", htmlSha256: ARTICLE_HTML_HASH } }),
+      tasks,
+    ),
+    base,
+  );
+  // 封面被换
+  assert.notEqual(
+    packagePreviewRevision(
+      articlePackageRecord({ coverPath: "/tmp/publishing/job-1/v1-package-1/cover-2.jpg" }),
+      tasks,
+    ),
+    base,
+  );
+  // 头条首发
+  assert.notEqual(
+    packagePreviewRevision(
+      articlePackageRecord({
+        toutiaoOptions: { firstPublish: true, declarations: [], crossPostWeitoutiao: false },
+      }),
+      tasks,
+    ),
+    base,
+  );
+  // 同时发微头条（默认关闭；打开就是多发一条内容）
+  assert.notEqual(
+    packagePreviewRevision(
+      articlePackageRecord({
+        toutiaoOptions: { firstPublish: false, declarations: [], crossPostWeitoutiao: true },
+      }),
+      tasks,
+    ),
+    base,
+  );
+  // 作品声明：集合敏感
+  assert.notEqual(
+    packagePreviewRevision(
+      articlePackageRecord({
+        toutiaoOptions: { firstPublish: false, declarations: ["个人观点，仅供参考"], crossPostWeitoutiao: false },
+      }),
+      tasks,
+    ),
+    base,
+  );
+  const twoDeclarations = articlePackageRecord({
+    toutiaoOptions: {
+      firstPublish: false,
+      declarations: ["个人观点，仅供参考", "引用AI"],
+      crossPostWeitoutiao: false,
+    },
+  });
+  assert.equal(
+    packagePreviewRevision(twoDeclarations, tasks),
+    packagePreviewRevision(
+      articlePackageRecord({
+        toutiaoOptions: {
+          firstPublish: false,
+          // 声明是集合语义：换个顺序不该让旧 revision 失效。
+          declarations: ["引用AI", "个人观点，仅供参考"],
+          crossPostWeitoutiao: false,
+        },
+      }),
+      tasks,
+    ),
+  );
+});
+
+test("video 与 note 的指纹逐字节不变（article 分支不得影响存量）", () => {
+  // 这两个字面量是 2026-09-18 加 article 分支**之前**的值，属于回归门禁：
+  // 文章指纹必须是新增分支，而不是把 video/note 的分支顺手重构掉。
+  const video = packagePreviewRevision(packageRecord(), [taskRecord()]);
+  const note = packagePreviewRevision(notePackageRecord(), [taskRecord()]);
+  assert.match(video, /^[0-9a-f]{64}$/u);
+  assert.match(note, /^[0-9a-f]{64}$/u);
+  assert.notEqual(video, note);
+  // 内容类型本身进指纹：同一份记录换个 contentType 必然不同。
+  assert.notEqual(packagePreviewRevision(packageRecord({ contentType: "article" }), [taskRecord()]), video);
+});
+
+test("未登记的 (内容类型 × 平台) 组合被拒且不写盘；视频包保留既有错误码", async () => {
+  const { store, readIndexBytes } = await seededFixture();
+  const before = await readIndexBytes();
+
+  // 视频包（既有行为）：错误码与文案一字未改。
+  await assert.rejects(
+    store.beginAutoPublish("task-1", { previewRevision: "whatever", attemptId: "attempt-1" }, ACTOR),
+    isPublishingError("publish_not_a_note_package"),
+  );
+
+  // 图文包 + 头条任务：组合未登记 → 新错误码，且同样不写盘。
+  const noteTaskWithToutiao = taskRecord("ready", { platform: "toutiao" });
+  const note = notePackageRecord();
+  const fixture = await seededCustomFixture([note], [noteTaskWithToutiao]);
+  const indexBefore = await fixture.readIndexBytes();
+  await assert.rejects(
+    fixture.store.beginAutoPublish(
+      noteTaskWithToutiao.id,
+      { previewRevision: packagePreviewRevision(note, [noteTaskWithToutiao]), attemptId: "attempt-x" },
+      ACTOR,
+    ),
+    isPublishingError("publish_auto_publish_unsupported"),
+  );
+  assert.deepEqual(await fixture.readIndexBytes(), indexBefore);
+  assert.equal((await fixture.store.getTask(noteTaskWithToutiao.id))!.autoPublish, undefined);
+
+  assert.deepEqual(await readIndexBytes(), before);
+});
+
+// ─── ③ 小红书图文选项（xhsOptions）与**指纹兼容性** ─────────────────────────────
+
+/**
+ * 这两个哈希是 2026-09-20 **加 `xhsOptions` 之前**算出来的，**故意写死**。
+ *
+ * 守住的是这样一件事：新字段如果被**无条件**塞进 `note` 分支的哈希流
+ *（哪怕只有一个 `\0` 分隔的参数），**所有既有抖音图文包的 `previewRevision` 都会变**，
+ * 于是「预览过、还没提交」的包会突然全部报 409。那种红是「指纹口径被悄悄改了」，
+ * 不是「功能坏了」—— 所以必须有一条 baseline 用例把它钉住。
+ */
+const NOTE_REVISION_BASELINE = "556e908c1b44ed1368e3c9fed87df37627bd2de385ada657fd093f6fab510abb";
+// ⚠️ 这个值**必须从真实夹具上取**，不能拿手抄的副本去算 —— 第一版我就是手抄了一份
+// `packageRecord()`，`videoSha256` 与夹具不同，于是「基线」本身就是错的（实测踩到）。
+const VIDEO_REVISION_BASELINE = "0007ffeb520fda524dbfbf42863f8489e6006e07a3748d9013d6e378fe4e918d";
+
+test("⚠️ 兼容性基线：不含 xhsOptions 的包，其 previewRevision 与改动前**逐字节相同**", () => {
+  assert.equal(
+    packagePreviewRevision(notePackageRecord(), [taskRecord()]),
+    NOTE_REVISION_BASELINE,
+    "图文包的指纹口径被改动了 —— 既有抖音图文包会在「预览后」突然全部 409",
+  );
+  assert.equal(
+    packagePreviewRevision(packageRecord(), [taskRecord()]),
+    VIDEO_REVISION_BASELINE,
+    "视频包的指纹口径被改动了",
+  );
+  // 显式给 undefined 与「压根不给」必须完全等价（存档里两种形态都会出现）。
+  assert.equal(
+    packagePreviewRevision(notePackageRecord({ xhsOptions: undefined }), [taskRecord()]),
+    NOTE_REVISION_BASELINE,
+  );
+});
+
+test("xhsOptions 参与指纹：AI 声明与「是否提交」任一变化都让旧 revision 失效", () => {
+  const base = notePackageRecord({ xhsOptions: { aiDeclaration: true, submit: false } });
+  const aiOff = notePackageRecord({ xhsOptions: { aiDeclaration: false, submit: false } });
+  const willSubmit = notePackageRecord({ xhsOptions: { aiDeclaration: true, submit: true } });
+
+  const baseRevision = packagePreviewRevision(base, [taskRecord()]);
+  assert.notEqual(
+    packagePreviewRevision(aiOff, [taskRecord()]),
+    baseRevision,
+    "取消 AI 标识声明必须让旧 revision 失效（否则会出现「预览时没声明、提交时声明了」）",
+  );
+  assert.notEqual(
+    packagePreviewRevision(willSubmit, [taskRecord()]),
+    baseRevision,
+    "改「是否真点发布」同样改变「要发生什么」，必须进指纹",
+  );
+  // 幂等：同样的内容必须得到同样的指纹。
+  assert.equal(
+    packagePreviewRevision(notePackageRecord({ xhsOptions: { aiDeclaration: true, submit: false } }), [taskRecord()]),
+    baseRevision,
+  );
+});
+
+test("存档形状：xhsOptions 畸形（非布尔）视为**索引损坏**，而不是静默丢掉该字段", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "publishing-store-xhs-shape-"));
+  const storage = new LocalStorage(root);
+  const storagePath = path.join(root, "cache", "publishing-index.json");
+  await mkdir(path.dirname(storagePath), { recursive: true });
+
+  // 结构上是合法 JSON，但 xhsOptions 里的值是字符串 —— 属于「索引损坏」这条既定口径。
+  const index = seededIndex(
+    [notePackageRecord({ xhsOptions: { aiDeclaration: "yes", submit: false } as never })],
+    [taskRecord()],
+  );
+  await writeFile(storagePath, JSON.stringify(index));
+  const store = new PublishingStore(storage, () => new Date(NOW));
+
+  await store.init();
+
+  // 与既有口径一致：坏索引保持只读，任何写入都被拒。
+  assert.deepEqual((await store.snapshot()).packages, {});
+  await assert.rejects(
+    () => store.reserveVersion("job-1"),
+    (error: PublishingError) => error.code === "publish_index_corrupt",
+  );
+});

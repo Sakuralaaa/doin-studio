@@ -1,0 +1,159 @@
+{
+  "name": "doin-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",
+    "dev:renderer": "vite",
+    "dev:electron": "npm run build:electron && npm run mark-cjs && wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .",
+    "build": "npm run build:renderer && npm run build:electron && npm run build:backend && npm run mark-cjs",
+    "build:renderer": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "build:backend": "tsc -p tsconfig.json",
+    "mark-cjs": "node scripts/mark-cjs.mjs",
+    "prepare:whisper": "node scripts/prepare-whisper.mjs",
+    "check:whisper": "node scripts/check-whisper-assets.mjs",
+    "prepare:package:mac": "node scripts/prepare-package-assets.mjs --target=mac",
+    "prepare:package:win": "node scripts/prepare-package-assets.mjs --target=win",
+    "check:package-assets": "node scripts/check-package-assets.mjs",
+    "package": "npm run package:mac",
+    "package:mac": "npm run prepare:package:mac && npm run build && npm run check:package-assets && electron-builder --mac --arm64",
+    "package:win": "npm run prepare:package:win && npm run build && npm run check:package-assets && electron-builder --win --x64",
+    "package:win11": "npm run package:win",
+    "package:all": "npm run package:mac && npm run package:win",
+    "start": "node dist/server.js",
+    "test": "node --import tsx --test \"src/**/*.test.ts\" \"electron/**/*.test.ts\" \"renderer/src/**/*.test.ts\" \"renderer/src/**/*.test.tsx\"",
+    "test:hyperframes": "RUN_HYPERFRAMES_INTEGRATION=1 node --import tsx --test src/lib/hyperframes-video.integration.test.ts",
+    "check": "npm run check:backend && npm run check:renderer && npm run check:secrets",
+    "check:secrets": "node --import tsx scripts/check-secrets.ts",
+    "check:backend": "tsc -p tsconfig.json --noEmit",
+    "check:renderer": "tsc -p tsconfig.renderer.json --noEmit"
+  },
+  "dependencies": {
+    "@types/react-router-dom": "^5.3.3",
+    "axios": "^1.18.1",
+    "better-sqlite3": "^13.0.3",
+    "cheerio": "1.0.0",
+    "express": "^4.21.2",
+    "gsap": "3.14.2",
+    "lucide-react": "^1.23.0",
+    "multer": "^2.4.0",
+    "openai": "^4.104.0",
+    "opencc-js": "1.4.0",
+    "playwright": "^1.62.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-router-dom": "^7.18.1",
+    "sm-crypto": "^0.5.5",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.2",
+    "@types/express": "^5.0.1",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^22.15.21",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "autoprefixer": "^10.5.2",
+    "concurrently": "^10.0.3",
+    "cross-env": "^10.1.0",
+    "electron": "^42.5.1",
+    "electron-builder": "^26.15.3",
+    "postcss": "^8.5.16",
+    "tailwindcss": "^4.3.2",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "^8.1.0",
+    "wait-on": "^9.0.10"
+  },
+  "build": {
+    "files": [
+      "package.json",
+      "dist/**/*",
+      "dist-electron/**/*",
+      "dist-renderer/**/*",
+      "docs/third-party/**/*",
+      "!dist/mac*/**/*",
+      "!dist/win*/**/*",
+      "!dist/*.dmg",
+      "!dist/*.zip",
+      "!dist/*.exe",
+      "!dist/*.blockmap",
+      "!dist/*.yml",
+      "!storage/**/*",
+      "!vendor/**/*",
+      "!src/**/*",
+      "!renderer/**/*",
+      "!backend/**/*",
+      "!scripts/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/package-assets/bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "vendor/package-assets/whisper",
+        "to": "whisper",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "vendor/package-assets/hyperframes/package.json",
+        "to": "hyperframes/package.json"
+      },
+      {
+        "from": "vendor/package-assets/hyperframes/package-lock.json",
+        "to": "hyperframes/package-lock.json"
+      },
+      {
+        "from": "vendor/package-assets/hyperframes/node_modules",
+        "to": "hyperframes/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "vendor/package-assets/browser",
+        "to": "browser",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "vendor/package-assets/manifest.json",
+        "to": "runtime-assets-manifest.json"
+      }
+    ],
+    "appId": "dev.sakuralaaa.doinstudio",
+    "productName": "Doin Studio",
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        {
+          "arch": [
+            "x64"
+          ],
+          "target": "nsis"
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "Doin-Studio-${version}-windows-${arch}.${ext}",
+      "allowToChangeInstallationDirectory": true,
+      "oneClick": false
+    },
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**"
+    ]
+  }
+}

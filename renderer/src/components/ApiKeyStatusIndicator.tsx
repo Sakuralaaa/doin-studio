@@ -1,0 +1,54 @@
+import React, { useEffect, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import { hasValidApiKey } from '../utils/apiKeyValidator';
+
+export function ApiKeyStatusIndicator({ compact }: { compact?: boolean }) {
+  const [hasKey, setHasKey] = useState<boolean | null>(null);
+  const location = useLocation();
+
+  // 路由变化时重新检查
+  useEffect(() => {
+    checkApiKey();
+  }, [location.pathname]);
+
+  const checkApiKey = async () => {
+    const valid = await hasValidApiKey();
+    setHasKey(valid);
+  };
+
+  // 检查中
+  if (hasKey === null) {
+    return (
+      <div className="flex items-center gap-2">
+        <span className="w-2 h-2 bg-ink-subtle rounded-full animate-pulse" />
+        <span className="text-sm text-ink-muted">{compact ? '检查中...' : '检查中...'}</span>
+      </div>
+    );
+  }
+
+  // 已配置
+  if (hasKey) {
+    return (
+      <div className="flex items-center gap-2">
+        <span className="w-2 h-2 bg-success rounded-full" />
+        <span className={`text-sm text-ink-muted ${compact ? 'text-xs' : ''}`}>{compact ? 'AI 已连接' : 'API 已配置'}</span>
+      </div>
+    );
+  }
+
+  // 未配置
+  return (
+    <div className="flex items-center gap-3">
+      <span className="w-2 h-2 bg-warning rounded-full" />
+      <span className={`${compact ? 'text-xs' : 'text-sm'} text-warning`}>
+        {compact ? '未配置 AI' : '未配置 AI'}
+      </span>
+      <Link
+        to="/settings"
+        className="text-sm text-accent hover:underline"
+      >
+        前往设置
+      </Link>
+    </div>
+  );
+}

@@ -1,0 +1,290 @@
+@import "tailwindcss";
+
+/*
+ * 抖创工坊 · 设计令牌（方向「剪辑台」）
+ *
+ * 设计锚点是这个产品自己的世界：竖屏 9:16 流水线（分镜、时间轴、监视器）。
+ * 所以底色取「监视器黑」家族——近黑但不是纯黑，并留出 4 级明度分层；
+ * 强调色取抖音品牌红 #FE2C55（来自产品身份，而不是任意一个高饱和色）。
+ *
+ * ⚠️ 这是令牌的唯一真源。tailwind.config.js 在 Tailwind v4 下**不会加载**
+ *   （全仓无 `@config` 指令），本次改造已删除它。不要再建第二份。
+ *
+ * 所有文字色与控件边界的对比度都经脚本实算后锁定（51 项全通过）。改动前请重跑校验：
+ *   正文/次要/三级 ≥4.5、状态文字压自身 soft 底 ≥4.5、
+ *   可交互控件边界 ≥3（WCAG 1.4.11）、装饰线不承载信息故不设门槛。
+ */
+@theme {
+  /* ---- 分层底：监视器黑家族，4 级明度 ---- */
+  --color-canvas: #090a0d; /* 应用底 */
+  --color-panel: #11141a; /* 面板 / 卡片 */
+  --color-elevated: #1e232d; /* 悬浮 / 选中 / hover */
+  --color-well: #0b0d11; /* 凹陷：输入框、代码块、预览区 */
+
+  /* ---- 线 ---- */
+  --color-line: #232931; /* 装饰性分隔与卡片轮廓（刻意低对比、不承载信息） */
+  --color-line-strong: #2f3742; /* 需要更明确的分组边界 */
+  --color-line-ui: #606e82; /* 可交互控件边界，≥3:1（WCAG 1.4.11） */
+
+  /* ---- 文字 ---- */
+  --color-ink: #e6eaf0; /* 主文字 15.9:1 @canvas */
+  --color-ink-muted: #98a2b3; /* 次要 7.45:1 @canvas */
+  --color-ink-subtle: #848e9c; /* 三级 4.98:1 @elevated（最亮底） */
+  --color-on-accent: #0d0f12; /* 强调色上的字：近黑 5.21:1（白字只有 3.68，不达标） */
+  --color-on-media: #e6eaf0; /* 图片蒙版和视频监视器始终是深底，不随页面变深字 */
+
+  /* ---- 强调（抖音品牌红）---- */
+  --color-accent: #fe2c55; /* 图标/指示/焦点环/进度：4.88:1 @panel */
+  --color-accent-hover: #ff4d6d;
+  --color-accent-soft: #33131c;
+  --color-accent-line: #7a2436;
+
+  /* ---- 语义状态 ---- */
+  --color-success: #3dd68c;
+  --color-success-soft: #16352a;
+  --color-success-line: #39785a;
+
+  --color-warning: #f5a524;
+  --color-warning-soft: #3a2e19;
+  --color-warning-line: #87682a;
+
+  --color-danger: #ff6166;
+  --color-danger-soft: #402126;
+  --color-danger-line: #9e444b;
+
+  --color-info: #5aa9ff;
+  --color-info-soft: #1a2e44;
+  --color-info-line: #366090;
+
+  --color-running: #4cd4e0; /* 进行中：与抖音的撞色语汇呼应 */
+  --color-running-soft: #12302f;
+  --color-running-line: #2a6b6e;
+
+  --color-ai: #a78bfa; /* AI 洗稿 / Skill 相关 */
+  --color-ai-soft: #2a2452;
+  --color-ai-line: #66579f;
+
+  /* ---- 字体角色 ---- */
+  /* body：中文界面就该用系统中文黑体，而不是笼统的 system-ui */
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui,
+    -apple-system, "Segoe UI", sans-serif;
+  /* display：中文衬线做标题，是这界面最容易识别的性格来源（仅用于 ≥20px） */
+  --font-display: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  /* utility：时间码 / jobId / 字数计数 */
+  --font-mono: "SF Mono", "JetBrains Mono", Menlo, ui-monospace, monospace;
+
+  /* ---- 微交互时长（清单要求 80–150ms 反馈 / 150–300ms 微交互）---- */
+  --duration-press: 90ms;
+  --duration-ui: 160ms;
+}
+
+@layer base {
+  :root {
+    font-synthesis: none;
+  }
+
+  /* 默认保持旧深色，选中浅色时由根元素覆盖原生控件与全局令牌。 */
+  html {
+    color-scheme: dark;
+    background: var(--color-canvas);
+  }
+
+  * {
+    box-sizing: border-box;
+    letter-spacing: 0;
+  }
+
+  body {
+    min-width: 320px;
+    min-height: 100vh;
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    color: inherit;
+  }
+
+  button,
+  summary {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /*
+   * Tailwind v4 的 preflight 不再给 button 设 pointer，浏览器默认是箭头光标。
+   * 改造前实测：7 个页面里 **148 个 <button> 没有一个**是手型。这里一次兜住。
+   */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  summary,
+  label[for] {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+
+  /* 按压反馈基线：改造前全仓 0 处 active: 变体，点击毫无手感。 */
+  button:not(:disabled):active,
+  [role="button"]:not([aria-disabled="true"]):active {
+    transform: translateY(1px);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: var(--color-accent);
+    color: var(--color-on-accent);
+  }
+
+  /* 深色下的滚动条（原先未声明 color-scheme，浅色滚动条会刺眼） */
+  * {
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-line-ui);
+  }
+}
+
+/* 浅色「日间剪辑台」：同一套语义令牌，不逐页维护第二套类名。 */
+:root[data-theme='light'] {
+  color-scheme: light;
+  --color-canvas: #f2f4f8;
+  --color-panel: #ffffff;
+  --color-elevated: #e6eaf0;
+  --color-well: #f7f9fc;
+  --color-line: #d5dce6;
+  --color-line-strong: #afbac9;
+  --color-line-ui: #657389;
+  --color-ink: #1d2533;
+  --color-ink-muted: #4c5a6d;
+  --color-ink-subtle: #536074;
+  --color-on-accent: #ffffff;
+  --color-accent: #c91c43;
+  --color-accent-hover: #ae1437;
+  --color-accent-soft: #fdebf0;
+  --color-accent-line: #c86d84;
+  --color-success: #126b43;
+  --color-success-soft: #e7f5ec;
+  --color-success-line: #6c9b7f;
+  --color-warning: #88520a;
+  --color-warning-soft: #fff3dd;
+  --color-warning-line: #b18443;
+  --color-danger: #bd2230;
+  --color-danger-soft: #fff0f1;
+  --color-danger-line: #cb7780;
+  --color-info: #175daf;
+  --color-info-soft: #eaf2ff;
+  --color-info-line: #7597c5;
+  --color-running: #0b6870;
+  --color-running-soft: #e6f4f5;
+  --color-running-line: #6f9ba0;
+  --color-ai: #6540b5;
+  --color-ai-soft: #f1ecfc;
+  --color-ai-line: #9d83c9;
+}
+
+/*
+ * 改造前 ActiveJobStrip 引用了 animate-[indeterminate_...]，
+ * 但全仓**没有任何 @keyframes** ⇒ 浏览器直接忽略整条动画，那条「不确定进度条」
+ * 其实是个静止色块（而测试只断言「不出现百分比」，所以一直是绿的）。
+ */
+@keyframes indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+/* Safe area utilities for notched devices */
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+/* Supplied Doyin Studio visual system. Both new and retained workflows consume
+   the canonical semantic colors above, so theme changes affect every page. */
+@theme {
+  --color-studio-canvas: var(--color-canvas);
+  --color-studio-panel: var(--color-panel);
+  --color-studio-surface: var(--color-elevated);
+  --color-studio-elevated: var(--color-elevated);
+  --color-studio-well: var(--color-well);
+  --color-studio-border: var(--color-line);
+  --color-studio-border-subtle: var(--color-line);
+  --color-studio-border-strong: var(--color-line-strong);
+  --color-studio-ink: var(--color-ink);
+  --color-studio-ink-secondary: var(--color-ink-muted);
+  --color-studio-ink-muted: var(--color-ink-subtle);
+  --color-studio-accent: var(--color-accent);
+  --color-studio-accent-hover: var(--color-accent-hover);
+  --color-studio-accent-subtle: var(--color-accent-soft);
+  --color-studio-accent-border: var(--color-accent-line);
+  --color-studio-success: var(--color-success);
+  --color-studio-success-subtle: var(--color-success-soft);
+  --color-studio-success-border: var(--color-success-line);
+  --color-studio-warning: var(--color-warning);
+  --color-studio-warning-subtle: var(--color-warning-soft);
+  --color-studio-warning-border: var(--color-warning-line);
+  --color-studio-danger: var(--color-danger);
+  --color-studio-danger-subtle: var(--color-danger-soft);
+  --color-studio-danger-border: var(--color-danger-line);
+  --color-studio-info: var(--color-info);
+  --color-studio-info-subtle: var(--color-info-soft);
+  --color-studio-info-border: var(--color-info-line);
+}
+
+.studio-rail { width: var(--studio-rail); transition: width 160ms ease; }
+@media (min-width: 768px) {
+  .studio-header { left: var(--studio-rail); transition: left 160ms ease; }
+  .studio-content { margin-left: var(--studio-rail); transition: margin-left 160ms ease; }
+}
+.studio-shell .rounded-lg { border-radius: 12px; }
+.studio-shell .font-display { font-family: var(--font-sans); }
+.studio-card-hover { transition: border-color 160ms ease, box-shadow 160ms ease; }
+.studio-card-hover:hover { box-shadow: 0 8px 28px rgb(0 0 0 / 15%); }
+.studio-shell :is(button, input, textarea, select, a):focus-visible { outline: 2px solid var(--color-accent); outline-offset: 3px; }
+
+/* 数据要能竖着扫（剪辑台语汇）：时间码 / 计数 / ID */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

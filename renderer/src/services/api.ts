@@ -1,0 +1,1166 @@
+import type { ArticleRecord, ArticleStep, ArticlePreview } from '../../../src/lib/article-types';
+import type { BenchmarkView, BenchmarkSearchResult } from '../../../src/lib/wechat-benchmarks';
+import axios, { AxiosInstance, type AxiosRequestConfig } from 'axios';
+import type { ImagePromptInput, ImagePromptRecord } from '../../../src/lib/image-prompts';
+import type { ImageAssetMetadata } from '../../../src/lib/assets-store';
+import type { Gallery, GalleryDraft, GalleryPreview, GallerySource } from '../../../src/lib/gallery-types';
+import type { HotspotBoard, HotspotFavorite } from '../../../src/lib/hotspots';
+import type { AudioBoard, AudioImportBatch, AudioPreview } from '../../../src/lib/online-audio';
+import type { AudioSource, AudioBoardId, OnlineTrack } from '../../../src/lib/online-audio-sources';
+import type {
+  ApiResponse,
+  CleanedScript,
+  CollectionOverview,
+  CollectionTranscriptsResponse,
+  ConfirmedPublishingAction,
+  AssetKind,
+  AssetRecord,
+  CreatePublishingPackageInput,
+  CreatePublishingVersionInput,
+  CrawlUserPageResult,
+  DeliveryPackage,
+  DueNotification,
+  GenerateSkillResponse,
+  HyperframesVideoOutput,
+  Job,
+  JobOverview,
+  JobStepStreamEvent,
+  LocalUserSessionResponse,
+  NoteImageSource,
+  ParsedApiError,
+  PipelineStep,
+  StreamablePipelineStep,
+  PublishPlatform,
+  PublishingActionErrorType,
+  PublishingAssetInspection,
+  PublishingListFilters,
+  PublishingPackagePreview,
+  PublishingPackageDetail,
+  PublishingPreview,
+  PackageContentType,
+  PublishTask,
+  RawTranscript,
+  RestoredPublishingPackage,
+  RuntimeChannelId,
+  RuntimeCheckSummary,
+  RuntimeStatusResponse,
+  UpdatePublishingContentInput,
+} from '../types';
+import { parseSkillProgressLine, type SkillProgressEvent } from '../utils/skill-progress';
+
+export const ONLINE_AUDIO_BATCH_KEY = 'douyin-ai-video.online-audio-batch';
+
+export function parseApiError(error: unknown): ParsedApiError {
+  const response = (error as {
+    response?: { status?: unknown; data?: { code?: unknown; message?: unknown; details?: unknown } };
+  })?.response;
+  // `publishingRequest` 抛出的是**扁平化**的 PublishingApiError：code/message/details 直接挂在
+  // error 上，没有 axios 的 `response`。只认 response 会让所有发布错误退化成通用文案，
+  // 后端辛苦写的明确提示（例如未配置 sau 的安装指引）就到不了用户眼前。
+  const flat = error as {
+    name?: unknown; code?: unknown; message?: unknown; details?: unknown; status?: unknown;
+  };
+  const flattened = flat?.name === 'PublishingApiError';
+  const text = (value: unknown) => (typeof value === 'string' && value.trim() ? value : undefined);
+
+  return {
+    code: text(response?.data?.code) ?? (flattened ? text(flat.code) : undefined) ?? 'request_failed',
+    message: text(response?.data?.message)
+      ?? (flattened ? text(flat.message) : undefined)
+      ?? '发布请求失败，请稍后重试',
+    ...((response?.data?.details ?? (flattened ? flat.details : undefined)) === undefined
+      ? {}
+      : { details: response?.data?.details ?? flat.details }),
+    ...(typeof (response?.status ?? (flattened ? flat.status : undefined)) === 'number'
+      ? { status: (response?.status ?? flat.status) as number }
+      : {}),
+  };
+}
+
+export function parseJobStepStreamEvent(value: string): JobStepStreamEvent | null {
+  try {
+    const event = JSON.parse(value) as Partial<JobStepStreamEvent>;
+    if (!Number.isFinite(event.id) || typeof event.jobId !== 'string') return null;
+    if (!['clean', 'generate_video_prompts'].includes(event.step ?? '')) return null;
+    if (!['started', 'preview', 'completed', 'paused', 'error'].includes(event.type ?? '')) return null;
+    return event as JobStepStreamEvent;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 这个 401 是否属于「后端重启导致内存会话失效」，值得静默重开会话后重放一次。
+ *
+ * 背景：`LocalSessionStore` 的会话是**纯内存**的，后端一重启全部作废；而本项目按
+ * AGENTS.md 的要求频繁重启后端。界面里的登录/切换入口**已全部移除**，所以客户端
+ * 没有别的自救手段 —— 不自动重开会话，用户就会看到一句属于已移除功能的
+ * 「请选择当前操作者」（2026-09-17 用户实测反馈）。
+ */
+export function isStaleLocalSession(error: unknown): boolean {
+  const candidate = error as {
+    response?: { status?: unknown; data?: { code?: unknown } };
+    config?: { url?: unknown; _sessionRetried?: unknown };
+  };
+  if (candidate?.response?.status !== 401) return false;
+  if (candidate.response.data?.code !== 'local_session_required') return false;
+  if (candidate.config?._sessionRetried === true) return false;   // 只重放一次，避免死循环
+  const url = typeof candidate.config?.url === 'string' ? candidate.config.url : '';
+  if (url.includes('/api/local-sessions')) return false;          // 会话接口自身失败不再递归重开
+  return true;
+}
+
+export class ApiClient {
+  private client: AxiosInstance | null = null;
+  private serverPort: number | null = null;
+  private localSessionToken: string | null = null;
+  /** 并发的 401 只触发一次重开会话（避免惊群）。 */
+  private sessionRefresh: Promise<void> | null = null;
+
+  async getOnlineAudioCatalog(): Promise<{ sources: { id: AudioSource; name: string }[]; boards: { id: AudioBoardId; name: string }[] }> {
+    return this.publishingRequest({ url: '/api/online-audio/catalog' });
+  }
+  async getOnlineAudioBoard(source: AudioSource, board: AudioBoardId, refresh = false): Promise<AudioBoard> {
+    return (await this.publishingRequest<{ board: AudioBoard }>({ url: refresh ? '/api/online-audio/boards/refresh' : '/api/online-audio/boards',
+      method: refresh ? 'POST' : 'GET', ...(refresh ? { data: { source, board } } : { params: { source, board } }) })).board;
+  }
+  async searchOnlineAudio(source: AudioSource, query: string): Promise<OnlineTrack[]> {
+    return (await this.publishingRequest<{ tracks: OnlineTrack[] }>({ url: '/api/online-audio/search', params: { source, q: query } })).tracks;
+  }
+  async previewOnlineAudio(trackKey: string): Promise<AudioPreview & { url: string }> {
+    const preview = (await this.publishingRequest<{ preview: AudioPreview }>({ url: '/api/online-audio/preview', method: 'POST', data: { trackKey }, timeout: 90_000 })).preview;
+    const client = await this.getClient();
+    return { ...preview, url: `${client.defaults.baseURL}/api/online-audio/media/${encodeURIComponent(preview.token)}` };
+  }
+  async importOnlineAudio(trackKeys: string[]): Promise<AudioImportBatch> {
+    const batch = (await this.publishingRequest<{ batch: AudioImportBatch }>({ url: '/api/online-audio/imports', method: 'POST', data: { trackKeys } })).batch;
+    // Persist before returning: the panel may have been unmounted while POST was pending.
+    try { if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(ONLINE_AUDIO_BATCH_KEY, JSON.stringify(batch)); } catch { /* Still return the accepted batch. */ }
+    return batch;
+  }
+  async getOnlineAudioImport(id: string): Promise<AudioImportBatch> {
+    return (await this.publishingRequest<{ batch: AudioImportBatch }>({ url: `/api/online-audio/imports/${encodeURIComponent(id)}` })).batch;
+  }
+
+  async getArticles(): Promise<ArticleRecord[]> { return (await this.publishingRequest<{articles:ArticleRecord[]}>({url:'/api/articles'})).articles; }
+  async getArticle(id: string): Promise<ArticleRecord> { return (await this.publishingRequest<{article:ArticleRecord}>({url:`/api/articles/${encodeURIComponent(id)}`})).article; }
+  async createArticle(input: {keyword?:string;hotspot?:{sourceId:string;itemId:string};benchmarkId?:string}): Promise<ArticleRecord> { return (await this.publishingRequest<{article:ArticleRecord}>({url:'/api/articles',method:'POST',data:input})).article; }
+  async getWechatBenchmarks(): Promise<BenchmarkView[]> {return (await this.publishingRequest<{groups:BenchmarkView[]}>({url:'/api/wechat-benchmarks'})).groups;}
+  async createWechatBenchmark(input: Record<string,unknown>): Promise<BenchmarkView> {return (await this.publishingRequest<{group:BenchmarkView}>({url:'/api/wechat-benchmarks',method:'POST',data:input})).group;}
+  async saveWechatBenchmark(id:string,input:Record<string,unknown>&{version:number}): Promise<BenchmarkView> {return (await this.publishingRequest<{group:BenchmarkView}>({url:`/api/wechat-benchmarks/${encodeURIComponent(id)}`,method:'PATCH',data:input})).group;}
+  async removeWechatBenchmark(id:string,version:number): Promise<void> {await this.publishingRequest({url:`/api/wechat-benchmarks/${encodeURIComponent(id)}`,method:'DELETE',data:{version}});}
+  async searchWechatBenchmarks(keyword:string): Promise<BenchmarkSearchResult> {return (await this.publishingRequest<{result:BenchmarkSearchResult}>({url:'/api/wechat-benchmarks/search',method:'POST',data:{keyword},timeout:25000})).result;}
+  async saveArticle(id: string, input: Record<string,unknown> & {version:number}): Promise<ArticleRecord> { return (await this.publishingRequest<{article:ArticleRecord}>({url:`/api/articles/${encodeURIComponent(id)}`,method:'PATCH',data:input})).article; }
+  async runArticleStep(id: string, step: ArticleStep, version: number): Promise<ArticleRecord> { return (await this.publishingRequest<{article:ArticleRecord}>({url:`/api/articles/${encodeURIComponent(id)}/steps/${step}`,method:'POST',data:{version},timeout:200000})).article; }
+  async readArticleSources(id: string, sourceIds: string[], version: number): Promise<ArticleRecord> { return (await this.publishingRequest<{article:ArticleRecord}>({url:`/api/articles/${encodeURIComponent(id)}/sources/read`,method:'POST',data:{sourceIds,version},timeout:60000})).article; }
+  async removeArticle(id: string, version: number): Promise<void> { await this.publishingRequest({url:`/api/articles/${encodeURIComponent(id)}`,method:'DELETE',data:{version}}); }
+  async previewArticle(id: string, version: number): Promise<ArticlePreview> { return (await this.publishingRequest<{preview:ArticlePreview}>({url:`/api/articles/${encodeURIComponent(id)}/publishing/preview`,method:'POST',data:{version}})).preview; }
+  async createArticlePackage(id: string, version: number, previewRevision: string): Promise<PublishingPackageDetail> { return (await this.publishingRequest<{detail:PublishingPackageDetail}>({url:`/api/articles/${encodeURIComponent(id)}/publishing/packages`,method:'POST',data:{version,previewRevision},timeout:120000})).detail; }
+
+  async getHotspots(refresh = false): Promise<HotspotBoard[]> {
+    return (await this.publishingRequest<{ boards: HotspotBoard[] }>({ url: refresh ? '/api/hotspots/refresh' : '/api/hotspots', method: refresh ? 'POST' : 'GET' })).boards;
+  }
+  async getHotspotFavorites(): Promise<HotspotFavorite[]> {
+    return (await this.publishingRequest<{ favorites: HotspotFavorite[] }>({ url: '/api/hotspots/favorites' })).favorites;
+  }
+  async saveHotspot(sourceId: string, itemId: string): Promise<HotspotFavorite> {
+    return (await this.publishingRequest<{ favorite: HotspotFavorite }>({ method: 'POST', url: '/api/hotspots/favorites', data: { sourceId, itemId } })).favorite;
+  }
+  async updateHotspotNote(id: string, note: string, version: number): Promise<HotspotFavorite> {
+    return (await this.publishingRequest<{ favorite: HotspotFavorite }>({ method: 'PATCH', url: `/api/hotspots/favorites/${encodeURIComponent(id)}`, data: { note, version } })).favorite;
+  }
+  async removeHotspot(id: string, version: number): Promise<void> {
+    await this.publishingRequest({ method: 'DELETE', url: `/api/hotspots/favorites/${encodeURIComponent(id)}`, data: { version } });
+  }
+
+  async getGalleries(): Promise<Gallery[]> {
+    return (await this.publishingRequest<{ galleries: Gallery[] }>({ url: '/api/galleries' })).galleries;
+  }
+  async createGallery(sourceJobId: string): Promise<Gallery> {
+    return (await this.publishingRequest<{ gallery: Gallery }>({ method: 'POST', url: '/api/galleries', data: { sourceJobId } })).gallery;
+  }
+  async getGallery(id: string): Promise<Gallery> {
+    return (await this.publishingRequest<{ gallery: Gallery }>({ url: `/api/galleries/${id}` })).gallery;
+  }
+  async saveGallery(id: string, draft: GalleryDraft & { version: number }): Promise<Gallery> {
+    return (await this.publishingRequest<{ gallery: Gallery }>({ method: 'PATCH', url: `/api/galleries/${id}`, data: draft })).gallery;
+  }
+  async deleteGallery(id: string, version: number): Promise<void> {
+    await this.publishingRequest({ method: 'DELETE', url: `/api/galleries/${id}`, data: { version } });
+  }
+  async renderGallery(id: string, version: number): Promise<Gallery> {
+    return (await this.publishingRequest<{ gallery: Gallery }>({ method: 'POST', url: `/api/galleries/${id}/render`, data: { version } })).gallery;
+  }
+  async getGallerySource(id: string): Promise<GallerySource> {
+    return (await this.publishingRequest<{ source: GallerySource }>({ url: `/api/galleries/${id}/source` })).source;
+  }
+  async getGalleryFrame(id: string, time: number): Promise<string> {
+    const blob = await this.publishingRequest<Blob>({ url: `/api/galleries/${id}/frame`, params: { time }, responseType: 'blob' });
+    return URL.createObjectURL(blob);
+  }
+  async getGalleryImageUrl(id: string, index: number, generation: string): Promise<string> {
+    await this.initialize();
+    return `http://localhost:${this.serverPort}/api/galleries/${id}/images/${index}?generation=${encodeURIComponent(generation)}`;
+  }
+  async previewGallery(id: string, version: number): Promise<GalleryPreview> {
+    return (await this.publishingRequest<{ preview: GalleryPreview }>({ method: 'POST', url: `/api/galleries/${id}/publishing/preview`, data: { version } })).preview;
+  }
+  async createGalleryPackage(id: string, previewRevision: string, rightsConfirmed: boolean): Promise<PublishingPackageDetail> {
+    return (await this.publishingRequest<{ detail: PublishingPackageDetail }>({ method: 'POST', url: `/api/galleries/${id}/publishing/packages`, data: { previewRevision, rightsConfirmed } })).detail;
+  }
+
+  async initialize() {
+    if (!this.serverPort) {
+      // Electron 环境下获取后端端口，浏览器开发模式下使用 Vite 代理
+      if (typeof window !== 'undefined' && window.electron?.getServerPort) {
+        this.serverPort = await window.electron.getServerPort();
+      } else {
+        this.serverPort = 5173; // Vite proxy port
+      }
+      this.client = axios.create({
+        baseURL: `http://localhost:${this.serverPort}`,
+        timeout: 960000,
+      });
+      this.client.interceptors.request.use((request) => {
+        if (this.localSessionToken) {
+          request.headers.set('X-Local-Session', this.localSessionToken);
+        }
+        return request;
+      });
+      // 会话过期（后端重启）时静默重开并重放一次：登录界面已移除，客户端必须自救。
+      // 请求拦截器会在重放时自动带上新 token，所以这里不用手工改 header。
+      this.client.interceptors.response.use(undefined, async (error: unknown) => {
+        if (!isStaleLocalSession(error)) throw error;
+        const config = (error as { config?: { _sessionRetried?: boolean } }).config;
+        if (!config) throw error;
+        config._sessionRetried = true;
+        try {
+          await this.refreshLocalOperatorSession();
+        } catch {
+          throw error;
+        }
+        return this.client!.request(config as Parameters<AxiosInstance['request']>[0]);
+      });
+    }
+    return this.client!;
+  }
+
+  async getClient() {
+    if (!this.client) {
+      await this.initialize();
+    }
+    return this.client!;
+  }
+
+  /** 静默重开一次本机操作者会话（无 PIN），并把新 token 装上。 */
+  private async refreshLocalOperatorSession(): Promise<void> {
+    if (!this.sessionRefresh) {
+      this.sessionRefresh = (async () => {
+        const response = await this.client!.post<LocalUserSessionResponse>('/api/local-sessions/auto');
+        this.localSessionToken = response.data.session.token;
+      })();
+      // 无论成败都清空，让后续请求可以再试
+      this.sessionRefresh = this.sessionRefresh.finally(() => { this.sessionRefresh = null; });
+    }
+    return this.sessionRefresh;
+  }
+
+  setLocalSession(token: string | null): void {
+    this.localSessionToken = token;
+  }
+
+  // 单一本机操作者：启动时向服务端索取一个无需 PIN 的本机操作者会话。
+  async openLocalOperatorSession(): Promise<LocalUserSessionResponse> {
+    const client = await this.getClient();
+    const response = await client.post<LocalUserSessionResponse>('/api/local-sessions/auto');
+    return response.data;
+  }
+
+  // ─── 素材库 ───────────────────────────────────────────────────────
+
+  async getAssets(kind?: AssetKind): Promise<AssetRecord[]> {
+    const client = await this.getClient();
+    const response = await client.get<{ assets: AssetRecord[] }>('/api/assets', {
+      params: kind ? { kind } : {},
+    });
+    return response.data.assets;
+  }
+
+  async uploadAssets(kind: AssetKind, files: File[]): Promise<AssetRecord[]> {
+    if (kind === 'image') {
+      const result = await this.uploadImageAssets(files);
+      if (result.failures?.length) throw new Error(`已入库 ${result.assets.length} 张；${result.failures.length} 张未成功：${result.failures.map(item => item.message).join('；')}`);
+      return result.assets;
+    }
+    const client = await this.getClient();
+    const form = new FormData();
+    for (const file of files) form.append('files', file);
+    // 不要手写 Content-Type：让运行时带上 multipart 的 boundary
+    const route = 'audio';
+    const response = await client.post<{ assets: AssetRecord[] }>(`/api/assets/${route}`, form);
+    return response.data.assets;
+  }
+
+  async getImagePrompts(): Promise<ImagePromptRecord[]> {
+    return (await this.publishingRequest<{ prompts: ImagePromptRecord[] }>({ url: '/api/image-prompts' })).prompts;
+  }
+  async createImagePrompts(input: ImagePromptInput): Promise<ImagePromptRecord[]> {
+    return (await this.publishingRequest<{ prompts: ImagePromptRecord[] }>({ method: 'POST', url: '/api/image-prompts', data: input, timeout: 75_000 })).prompts;
+  }
+  async updateImagePrompt(id: string, input: Pick<ImagePromptRecord, 'title' | 'tags' | 'prompt' | 'version'>): Promise<ImagePromptRecord> {
+    return (await this.publishingRequest<{ prompt: ImagePromptRecord }>({ method: 'PATCH', url: `/api/image-prompts/${encodeURIComponent(id)}`, data: input })).prompt;
+  }
+  async deleteImagePrompt(id: string, version: number): Promise<void> {
+    await this.publishingRequest({ method: 'DELETE', url: `/api/image-prompts/${encodeURIComponent(id)}`, data: { version } });
+  }
+  async searchImageAssets(q = ''): Promise<{ assets: AssetRecord[]; total: number }> {
+    return this.publishingRequest({ url: '/api/assets', params: { kind: 'image', q } });
+  }
+  async updateImageMetadata(id: string, input: ImageAssetMetadata & { version: number }): Promise<AssetRecord> {
+    return (await this.publishingRequest<{ asset: AssetRecord }>({ method: 'PATCH', url: `/api/assets/${encodeURIComponent(id)}/metadata`, data: input })).asset;
+  }
+  async uploadImageAssets(files: File[], metadata?: ImageAssetMetadata[], binding?: { id: string; version: number }): Promise<{ assets: AssetRecord[]; failures?: Array<{ index: number; code: string; message: string }> }> {
+    const data = new FormData();
+    for (const file of files) data.append('files', file);
+    if (metadata) data.append('metadata', JSON.stringify(metadata));
+    if (binding) { data.append('imagePromptId', binding.id); data.append('imagePromptVersion', String(binding.version)); }
+    return this.publishingRequest({ method: 'POST', url: '/api/assets/images', data });
+  }
+
+  async deleteAsset(id: string): Promise<void> {
+    const client = await this.getClient();
+    await client.delete(`/api/assets/${id}`);
+  }
+
+  /**
+   * 成片流的**绝对** URL。
+   *
+   * 不能用相对路径 `/api/jobs/:id/video/stream`：在 Electron 里页面来源是 Vite（5173），
+   * 相对路径会打到 Vite 的开发代理（→ 独立后端的仓库 storage），而不是 App 自己的内嵌后端，
+   * 结果是播放器黑屏 0:00（实测 404）。与 `getAssetRawUrl` 同一套做法。
+   */
+  async getJobVideoStreamUrl(jobId: string): Promise<string> {
+    const serverPort = this.serverPort || (typeof window !== 'undefined' && window.electron?.getServerPort ? await window.electron.getServerPort() : 5173);
+    return `http://localhost:${serverPort}/api/jobs/${jobId}/video/stream`;
+  }
+
+  async getAssetRawUrl(id: string): Promise<string> {
+    const serverPort = this.serverPort || (typeof window !== 'undefined' && window.electron?.getServerPort ? await window.electron.getServerPort() : 5173);
+    return `http://localhost:${serverPort}/api/assets/${id}/raw`;
+  }
+
+  private async publishingRequest<T>(config: AxiosRequestConfig): Promise<T> {
+    try {
+      const client = await this.getClient();
+      return (await client.request<T>(config)).data;
+    } catch (error) {
+      const parsed = parseApiError(error);
+      throw Object.assign(new Error(parsed.message), parsed, { name: 'PublishingApiError' });
+    }
+  }
+
+  async previewPublishing(
+    id: string,
+    platforms: PublishPlatform[],
+    contentType?: PackageContentType,
+    images?: { imageSource?: NoteImageSource; imageAssetIds?: string[]; articleImageAssetIds?: string[] },
+  ): Promise<PublishingPreview> {
+    const response = await this.publishingRequest<{ preview: PublishingPreview }>({
+      method: 'POST',
+      url: `/api/jobs/${id}/publishing/preview`,
+      data: {
+        platforms,
+        ...(contentType ? { contentType } : {}),
+        ...(images?.imageSource ? { imageSource: images.imageSource } : {}),
+        ...(images?.imageAssetIds ? { imageAssetIds: images.imageAssetIds } : {}),
+        ...(images?.articleImageAssetIds?.length ? { articleImageAssetIds: images.articleImageAssetIds } : {}),
+      },
+    });
+    return response.preview;
+  }
+
+  /** 包级预览：拿到 `previewRevision` 才能提交自动发布（服务端强制「发布前必经预览」）。 */
+  async getPublishingPackagePreview(packageId: string): Promise<PublishingPackagePreview> {
+    const response = await this.publishingRequest<{ preview: PublishingPackagePreview }>({
+      method: 'GET',
+      url: `/api/publishing/packages/${packageId}/preview`,
+    });
+    return response.preview;
+  }
+
+  /**
+   * 文章包的 `article.html`（降级通路：不能自动发布时，用户把它粘进头条编辑器）。
+   *
+   * 与封面/图片一样走带会话的请求取 blob —— `<a href>` 不会带 `X-Local-Session` 头。
+   */
+  async getPublishingArticleHtml(packageId: string): Promise<Blob> {
+    const response = await this.publishingRequest<Blob>({
+      method: 'GET',
+      url: `/api/publishing/packages/${packageId}/article`,
+      responseType: 'blob',
+    });
+    return response;
+  }
+
+  // ── 今日头条：登录态就是浏览器会话，只能扫码 ──────────────────────────────
+
+  /** 开始扫码登录，返回二维码 data URL（可直接放进 <img src>）。 */
+  async startToutiaoLogin(): Promise<{ qrDataUrl: string; startedAt: string; expiresAt: string }> {
+    return this.publishingRequest<{ qrDataUrl: string; startedAt: string; expiresAt: string }>({
+      method: 'POST',
+      url: '/api/publishing/toutiao/login',
+      data: {},
+    });
+  }
+
+  async pollToutiaoLogin(): Promise<{
+    status: 'idle' | 'waiting' | 'logged_in' | 'expired';
+    username?: string;
+  }> {
+    return this.publishingRequest<{ status: 'idle' | 'waiting' | 'logged_in' | 'expired'; username?: string }>({
+      method: 'GET',
+      url: '/api/publishing/toutiao/login',
+    });
+  }
+
+  /**
+   * 打开浏览器窗口扫码登录（与抖音二维码登录同一交互）。
+   * 同步请求：会一直等到扫码成功或超时（后端默认 180 秒），前端需要显示等待态。
+   */
+  async loginToutiaoInWindow(): Promise<{ loggedIn: boolean; username?: string; message: string }> {
+    return this.publishingRequest<{ loggedIn: boolean; username?: string; message: string }>({
+      method: 'POST',
+      url: '/api/publishing/toutiao/login/window',
+      data: {},
+    });
+  }
+
+  async cancelToutiaoLogin(): Promise<void> {
+    await this.publishingRequest<{ ok: boolean }>({
+      method: 'DELETE',
+      url: '/api/publishing/toutiao/login',
+    });
+  }
+
+  /** 零副作用自检：只开首页判登录态 + 读昵称，不填任何表单。 */
+  async verifyToutiaoLogin(): Promise<{ loggedIn: boolean; username?: string; message: string }> {
+    return this.publishingRequest<{ loggedIn: boolean; username?: string; message: string }>({
+      method: 'POST',
+      url: '/api/publishing/toutiao/verify',
+      data: {},
+    });
+  }
+
+  async verifyWechatAccount(): Promise<{ ok: boolean; credentials: { ok: boolean; message: string }; ipWhitelist: { ok: boolean; message: string }; draftPermission: { ok: boolean; message: string } }> {
+    return this.publishingRequest({ method: 'POST', url: '/api/publishing/wechat/verify' });
+  }
+
+  // ── 小红书：与头条那五条一一对应（同一套形状，端点换成 /publishing/xhs/*）──
+
+  async startXhsLogin(): Promise<{ qrDataUrl: string; startedAt: string; expiresAt: string }> {
+    return this.publishingRequest<{ qrDataUrl: string; startedAt: string; expiresAt: string }>({
+      method: 'POST',
+      url: '/api/publishing/xhs/login',
+    });
+  }
+
+  async pollXhsLogin(): Promise<{ status: 'idle' | 'waiting' | 'logged_in' | 'expired'; username?: string; qrDataUrl?: string }> {
+    return this.publishingRequest<{ status: 'idle' | 'waiting' | 'logged_in' | 'expired'; username?: string; qrDataUrl?: string }>({
+      method: 'GET',
+      url: '/api/publishing/xhs/login',
+    });
+  }
+
+  async cancelXhsLogin(): Promise<void> {
+    await this.publishingRequest<{ ok: boolean }>({ method: 'DELETE', url: '/api/publishing/xhs/login' });
+  }
+
+  async loginXhsInWindow(): Promise<{ loggedIn: boolean; username?: string; message: string }> {
+    return this.publishingRequest<{ loggedIn: boolean; username?: string; message: string }>({
+      method: 'POST',
+      url: '/api/publishing/xhs/login/window',
+    });
+  }
+
+  async verifyXhsLogin(): Promise<{ loggedIn: boolean; username?: string; message: string }> {
+    return this.publishingRequest<{ loggedIn: boolean; username?: string; message: string }>({
+      method: 'POST',
+      url: '/api/publishing/xhs/verify',
+    });
+  }
+
+  async openXhsDraftWindow(): Promise<{ message: string }> {
+    return this.publishingRequest<{ message: string }>({ method: 'POST', url: '/api/publishing/xhs/drafts/window' });
+  }
+
+  // ── 运行环境状态一览（免费检查零副作用；深检是后台任务 + 轮询）──
+
+  /** 五项**免费**检查 + 当前深检摘要。 */
+  async getRuntimeStatus(): Promise<RuntimeStatusResponse> {
+    return this.publishingRequest<RuntimeStatusResponse>({
+      method: 'GET',
+      url: '/api/runtime/status',
+    });
+  }
+
+  /** 发起深检。立刻返回 `running`（抖音那条最坏 5 分钟，不能同步等）。 */
+  async startRuntimeCheck(id: RuntimeChannelId): Promise<RuntimeCheckSummary> {
+    const response = await this.publishingRequest<{ check: RuntimeCheckSummary }>({
+      method: 'POST',
+      url: '/api/runtime/checks',
+      data: { id },
+    });
+    return response.check;
+  }
+
+  async getRuntimeCheck(checkId: string): Promise<RuntimeCheckSummary> {
+    const response = await this.publishingRequest<{ check: RuntimeCheckSummary }>({
+      method: 'GET',
+      url: `/api/runtime/checks/${checkId}`,
+    });
+    return response.check;
+  }
+
+  /** 取消检测。服务端会如实提示「可能留下会话锁，需要重新验证一次」。 */
+  async cancelRuntimeCheck(checkId: string): Promise<RuntimeCheckSummary> {
+    const response = await this.publishingRequest<{ check: RuntimeCheckSummary }>({
+      method: 'POST',
+      url: `/api/runtime/checks/${checkId}/cancel`,
+    });
+    return response.check;
+  }
+
+  /** 提交抖音图文。必须带上预览拿到的 `previewRevision`，缺/过期都会被服务端拒绝。 */
+  async autoPublishPublishingTask(
+    taskId: string,
+    previewRevision: string,
+    options: { dryRun?: boolean } = {},
+  ): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/auto-publish`,
+      // `dryRun` 只对小红书有意义（服务端会拒绝其它通路用它）：它只能把「点发布」降级成
+      // 「不点」，绝不会让一个声明了「只填草稿」的包真的发出去。
+      data: { previewRevision, ...(options.dryRun ? { dryRun: true } : {}) },
+    });
+    return response.task;
+  }
+
+  async submitPublishingAutoPublishCode(taskId: string, code: string): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/auto-publish/code`,
+      data: { code },
+    });
+    return response.task;
+  }
+
+  async inspectPublishingAssets(id: string): Promise<PublishingAssetInspection> {
+    const response = await this.publishingRequest<{ assets: PublishingAssetInspection }>({
+      method: 'GET',
+      url: `/api/jobs/${id}/publishing/assets`,
+    });
+    return response.assets;
+  }
+
+  async createPublishingPackage(
+    input: CreatePublishingPackageInput,
+  ): Promise<PublishingPackageDetail> {
+    const response = await this.publishingRequest<{ package: PublishingPackageDetail }>({
+      method: 'POST',
+      url: '/api/publishing/packages',
+      data: input,
+    });
+    return response.package;
+  }
+
+  async listPublishingPackages(
+    filters: PublishingListFilters = {},
+  ): Promise<PublishingPackageDetail[]> {
+    const response = await this.publishingRequest<{ packages: PublishingPackageDetail[] }>({
+      method: 'GET',
+      url: '/api/publishing/packages',
+      params: filters,
+    });
+    return response.packages;
+  }
+
+  async getPublishingPackage(id: string): Promise<PublishingPackageDetail> {
+    const response = await this.publishingRequest<{ package: PublishingPackageDetail }>({
+      method: 'GET',
+      url: `/api/publishing/packages/${id}`,
+    });
+    return response.package;
+  }
+
+  /**
+   * 图文包的第 `index` 张图（0 基）。
+   *
+   * 走**带会话的请求**取 blob，而不是把 URL 直接塞给 `<img src>`：图片接口是 `authenticated`
+   * 的，而浏览器给 `<img>` 发请求时不会带 `X-Local-Session` 头 → 401 → 破图。
+   * 与既有 `getPublishingCover` 同一套做法。
+   */
+  async getPublishingPackageImage(id: string, index: number): Promise<Blob> {
+    return this.publishingRequest<Blob>({
+      method: 'GET',
+      url: `/api/publishing/packages/${id}/images/${index}`,
+      responseType: 'blob',
+    });
+  }
+
+  async getPublishingCover(id: string): Promise<Blob> {
+    return this.publishingRequest<Blob>({
+      method: 'GET',
+      url: `/api/publishing/packages/${id}/cover`,
+      responseType: 'blob',
+    });
+  }
+
+  async checkPublishingDue(): Promise<{ notifications: DueNotification[] }> {
+    return this.publishingRequest<{ notifications: DueNotification[] }>({
+      method: 'POST',
+      url: '/api/publishing/due/check',
+      data: {},
+    });
+  }
+
+  async createPublishingVersion(
+    packageId: string,
+    input: CreatePublishingVersionInput,
+  ): Promise<PublishingPackageDetail> {
+    const response = await this.publishingRequest<{ package: PublishingPackageDetail }>({
+      method: 'POST',
+      url: `/api/publishing/packages/${packageId}/versions`,
+      data: input,
+    });
+    return response.package;
+  }
+
+  async updatePublishingContent(
+    taskId: string,
+    input: UpdatePublishingContentInput,
+  ): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'PATCH',
+      url: `/api/publishing/tasks/${taskId}/content`,
+      data: input,
+    });
+    return response.task;
+  }
+
+  async updatePublishingSchedule(taskId: string, scheduledAt: string | null): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'PATCH',
+      url: `/api/publishing/tasks/${taskId}/schedule`,
+      data: { scheduledAt },
+    });
+    return response.task;
+  }
+
+  async cancelPublishingTask(
+    taskId: string,
+    input: ConfirmedPublishingAction,
+  ): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/cancel`,
+      data: input,
+    });
+    return response.task;
+  }
+
+  async restorePublishingTask(taskId: string, scheduledAt: string | null): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/restore`,
+      data: { scheduledAt },
+    });
+    return response.task;
+  }
+
+  async markPublishingTaskPublished(
+    taskId: string,
+    input: ConfirmedPublishingAction,
+  ): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/mark-published`,
+      data: input,
+    });
+    return response.task;
+  }
+
+  async withdrawPublishingTask(
+    taskId: string,
+    input: ConfirmedPublishingAction & { reason: string },
+  ): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/withdraw`,
+      data: input,
+    });
+    return response.task;
+  }
+
+  async recordPublishingFailure(taskId: string, reason: string): Promise<PublishTask> {
+    const response = await this.publishingRequest<{ task: PublishTask }>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/record-failure`,
+      data: { reason },
+    });
+    return response.task;
+  }
+
+  async recordPublishingActionError(
+    taskId: string,
+    action: PublishingActionErrorType,
+    message: string,
+  ): Promise<void> {
+    await this.publishingRequest<void>({
+      method: 'POST',
+      url: `/api/publishing/tasks/${taskId}/action-error`,
+      data: { action, message },
+    });
+  }
+
+  async trashPublishingPackage(
+    packageId: string,
+    input: ConfirmedPublishingAction,
+  ): Promise<DeliveryPackage> {
+    const response = await this.publishingRequest<{ package: DeliveryPackage }>({
+      method: 'DELETE',
+      url: `/api/publishing/packages/${packageId}`,
+      data: input,
+    });
+    return response.package;
+  }
+
+  async restorePublishingPackage(packageId: string): Promise<RestoredPublishingPackage> {
+    return this.publishingRequest<RestoredPublishingPackage>({
+      method: 'POST',
+      url: `/api/publishing/packages/${packageId}/restore`,
+      data: {},
+    });
+  }
+
+  // 通用 GET 请求
+  async get(url: string): Promise<any> {
+    const client = await this.getClient();
+    return client.get(url);
+  }
+
+  // 创建任务
+  async createJob(params: {
+    sourceUrl?: string;
+    shareText?: string;
+    topic?: string;
+  }): Promise<Job> {
+    const client = await this.getClient();
+    const response = await client.post<ApiResponse>('/api/jobs', params);
+    return response.data.job!;
+  }
+
+  // 获取任务详情
+  async getJob(id: string): Promise<Job> {
+    const client = await this.getClient();
+    const response = await client.get<ApiResponse>(`/api/jobs/${id}`);
+    return response.data.job!;
+  }
+
+  async getJobOverviews(): Promise<JobOverview[]> {
+    const client = await this.getClient();
+    const response = await client.get<{ jobs: JobOverview[] }>('/api/jobs/overview');
+    return response.data.jobs || [];
+  }
+
+  // 执行一个手动步骤
+  async runJobStep(id: string, step: PipelineStep): Promise<Job> {
+    const client = await this.getClient();
+    const routeMap: Record<PipelineStep, string> = {
+      transcribe: 'transcribe',
+      clean: 'clean',
+      generate_video_prompts: 'generate-video-prompts',
+      generate_video: 'generate-video',
+    };
+    const response = await client.post<ApiResponse>(`/api/jobs/${id}/steps/${routeMap[step]}`);
+    return response.data.job!;
+  }
+
+  async pauseJobStep(id: string): Promise<Job> {
+    const client = await this.getClient();
+    const response = await client.post<ApiResponse>(`/api/jobs/${id}/steps/pause`);
+    return response.data.job!;
+  }
+
+  // 补充内容后重新洗稿
+  async recleanJob(id: string, supplementalText: string): Promise<Job> {
+    const client = await this.getClient();
+    const response = await client.post<ApiResponse>(`/api/jobs/${id}/reclean`, { supplementalText });
+    return response.data.job!;
+  }
+
+  async subscribeJobStepEvents(
+    id: string,
+    step: StreamablePipelineStep,
+    handlers: {
+      onEvent: (event: JobStepStreamEvent) => void;
+      onConnectionError?: (message: string) => void;
+    }
+  ): Promise<() => void> {
+    await this.initialize();
+    const source = new EventSource(`http://localhost:${this.serverPort}/api/jobs/${id}/steps/${step}/events`);
+    const eventTypes: JobStepStreamEvent['type'][] = ['started', 'preview', 'completed', 'paused', 'error'];
+    let terminal = false;
+    let consecutiveErrors = 0;
+    const listeners = eventTypes.map((type) => {
+      const listener = (raw: Event) => {
+        const parsed = parseJobStepStreamEvent((raw as MessageEvent<string>).data);
+        if (!parsed) return;
+        handlers.onEvent(parsed);
+        if (['completed', 'paused', 'error'].includes(parsed.type)) {
+          terminal = true;
+          source.close();
+        }
+      };
+      source.addEventListener(type, listener);
+      return { type, listener };
+    });
+    source.onopen = () => {
+      consecutiveErrors = 0;
+    };
+    source.onerror = () => {
+      if (terminal) return;
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= 3) {
+        source.close();
+        handlers.onConnectionError?.('实时连接已断开，任务仍会在后台继续执行');
+      }
+    };
+    return () => {
+      terminal = true;
+      for (const { type, listener } of listeners) source.removeEventListener(type, listener);
+      source.close();
+    };
+  }
+
+  // 获取垃圾桶任务
+  async getTrashJobs(): Promise<Job[]> {
+    const client = await this.getClient();
+    const response = await client.get<ApiResponse>('/api/jobs/trash');
+    return response.data.jobs || [];
+  }
+
+  // 移入垃圾桶
+  async deleteJob(id: string): Promise<Job> {
+    const client = await this.getClient();
+    const response = await client.delete<ApiResponse>(`/api/jobs/${id}`);
+    return response.data.job!;
+  }
+
+  // 恢复垃圾桶任务
+  async restoreJob(id: string): Promise<Job> {
+    const client = await this.getClient();
+    const response = await client.post<ApiResponse>(`/api/jobs/${id}/restore`);
+    return response.data.job!;
+  }
+
+  // 永久删除垃圾桶任务
+  async permanentlyDeleteJob(id: string): Promise<void> {
+    const client = await this.getClient();
+    await client.delete<ApiResponse>(`/api/jobs/${id}/permanent`);
+  }
+
+  // 获取清洗后的内容
+  async getJobCleaned(id: string): Promise<CleanedScript> {
+    const client = await this.getClient();
+    const response = await client.get<ApiResponse>(`/api/jobs/${id}/cleaned`);
+    return response.data.cleaned!;
+  }
+
+  // 获取原始转录文本
+  async getJobRawTranscript(id: string): Promise<RawTranscript> {
+    const client = await this.getClient();
+    const response = await client.get<ApiResponse>(`/api/jobs/${id}/raw-transcript`);
+    return response.data.rawTranscript!;
+  }
+
+  // 获取分镜（兼容历史视频提示词字段）
+  async getJobVideoPrompts(id: string): Promise<Pick<ApiResponse, 'planVersion' | 'targetDuration' | 'shortVideoScript' | 'shortVideoShots' | 'videoPrompts' | 'enhancedScenes' | 'videoOutline'>> {
+    const client = await this.getClient();
+    const response = await client.get<ApiResponse>(`/api/jobs/${id}/video-prompts`);
+    return {
+      planVersion: response.data.planVersion,
+      targetDuration: response.data.targetDuration,
+      shortVideoScript: response.data.shortVideoScript,
+      shortVideoShots: response.data.shortVideoShots,
+      videoPrompts: response.data.videoPrompts,
+      enhancedScenes: response.data.enhancedScenes,
+      videoOutline: response.data.videoOutline,
+    };
+  }
+
+  // 获取生成视频信息
+  async getJobVideoOutput(id: string): Promise<HyperframesVideoOutput> {
+    const client = await this.getClient();
+    const response = await client.get<ApiResponse>(`/api/jobs/${id}/video-output`);
+    return response.data.videoOutput!;
+  }
+
+  // 下载生成的视频
+  async downloadVideo(id: string): Promise<string> {
+    const serverPort = this.serverPort || (typeof window !== 'undefined' && window.electron?.getServerPort ? await window.electron.getServerPort() : 5173);
+    return `http://localhost:${serverPort}/api/jobs/${id}/video/download`;
+  }
+
+  async getVideoStreamUrl(id: string): Promise<string> {
+    const serverPort = this.serverPort || (typeof window !== 'undefined' && window.electron?.getServerPort ? await window.electron.getServerPort() : 5173);
+    return `http://localhost:${serverPort}/api/jobs/${id}/video/stream`;
+  }
+
+  // 已下载的原视频（视频转录步骤产出），与成片流地址同构
+  async getRawVideoStreamUrl(id: string): Promise<string> {
+    const serverPort = this.serverPort || (typeof window !== 'undefined' && window.electron?.getServerPort ? await window.electron.getServerPort() : 5173);
+    return `http://localhost:${serverPort}/api/jobs/${id}/raw-video/stream`;
+  }
+
+  // 健康检查
+  async healthCheck(): Promise<boolean> {
+    try {
+      const client = await this.getClient();
+      const response = await client.get('/health');
+      return response.data.ok === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // ─── 合集 API ──────────────────────────────────────────────
+
+  // 创建合集（爬取用户主页）
+  async createCollection(params: { pageUrl: string; maxItems?: number }): Promise<{ collection: any; crawlResult: CrawlUserPageResult }> {
+    const client = await this.getClient();
+    const response = await client.post('/api/collections', params);
+    return response.data;
+  }
+
+  // 列出所有合集
+  async getCollections(): Promise<CollectionOverview[]> {
+    const client = await this.getClient();
+    const response = await client.get('/api/collections');
+    return response.data.collections ?? [];
+  }
+
+  // 获取合集详情
+  async getCollection(id: string): Promise<CollectionOverview> {
+    const client = await this.getClient();
+    const response = await client.get(`/api/collections/${id}`);
+    return response.data.collection!;
+  }
+
+  // 获取合集中每个视频项的子任务状态
+  async getCollectionItemStates(id: string): Promise<Record<string, {
+    jobId: string;
+    status: string;
+    stage: string;
+    error?: string;
+  } | null>> {
+    const client = await this.getClient();
+    const response = await client.get(`/api/collections/${id}/item-states`);
+    return response.data.itemStates;
+  }
+
+  // 删除合集
+  async deleteCollection(id: string): Promise<void> {
+    const client = await this.getClient();
+    await client.delete(`/api/collections/${id}`);
+  }
+
+  // 增量更新合集 — 抓取新视频追加到已有合集
+  async updateCollection(id: string): Promise<{ collection: any; newItemsCount: number; message: string }> {
+    const client = await this.getClient();
+    const response = await client.post(`/api/collections/${id}/update`);
+    return response.data;
+  }
+
+  // 基于合集创建子任务
+  async createCollectionJobs(collectionId: string, selectedIds: string[], topic?: string): Promise<{ createdJobs: Job[]; collection: any }> {
+    const client = await this.getClient();
+    const response = await client.post(`/api/collections/${collectionId}/create-jobs`, {
+      selectedIds,
+      topic,
+    });
+    return response.data;
+  }
+
+  // 批量执行合集步骤
+  async batchRunCollectionStep(collectionId: string, step: PipelineStep): Promise<{ message: string; results: Array<{ jobId: string; status: string; error?: string }> }> {
+    const client = await this.getClient();
+    const routeMap: Record<PipelineStep, string> = {
+      transcribe: 'transcribe',
+      clean: 'clean',
+      generate_video_prompts: 'generate_video_prompts',
+      generate_video: 'generate_video',
+    };
+    /*
+     * ⚠️ 这条必须**关掉客户端超时**（`timeout: 0` = 不限时）。
+     *
+     * 后端的批量接口是「逐个子任务**串行** await、全部跑完才响应」（src/app.ts：
+     * `for (const jobId of collection.childJobIds) await jobs.runStep(...)`）。
+     * 而全局默认超时是 960000ms（16 分钟）—— 一个 100 条视频的合集做批量转录
+     * 轻易超过 16 分钟，于是 axios 抛超时、界面显示「批量执行失败」，
+     * **而后端还在继续跑**。用户看到失败就会重试，同一批任务被重复触发
+     * （与「重复发布是本功能最大的风险」同源）。
+     *
+     * 客户端超时既不会取消后端工作、也不代表任务失败，所以唯一正确的做法是不设超时；
+     * 进度与「不要重复点击」由界面负责（`runningStep` 期间全部批量按钮互斥 + 显示已用时长）。
+     */
+    const response = await client.post(
+      `/api/collections/${collectionId}/steps/${routeMap[step]}`,
+      undefined,
+      { timeout: 0 },
+    );
+    return response.data;
+  }
+
+  // 获取合集全部转录文本
+  async getCollectionTranscripts(id: string): Promise<CollectionTranscriptsResponse> {
+    const client = await this.getClient();
+    const response = await client.get(`/api/collections/${id}/transcripts`);
+    return response.data;
+  }
+
+  // 生成/更新 Skill（流式进度回调）
+  async generateSkill(
+    id: string,
+    options: { focusPrompt?: string; mode?: 'create' | 'update' },
+    onProgress?: (event: SkillProgressEvent) => void
+  ): Promise<GenerateSkillResponse> {
+    const client = await this.getClient();
+    const port = this.serverPort;
+
+    // 使用 fetch 以支持流式读取
+    const response = await fetch(`http://localhost:${port}/api/collections/${id}/generate-skill`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options),
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ message: `HTTP ${response.status}` }));
+      throw { response: { data: err } };
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('text/plain') && !response.body) {
+      // Plain JSON response (error case handled above)
+      const data = await response.json();
+      return data as GenerateSkillResponse;
+    }
+
+    // 流式读取 NDJSON
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalResult: GenerateSkillResponse | null = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = parseSkillProgressLine(line);
+        if (!event) continue;
+        onProgress?.(event);
+        if (event.success) {
+          finalResult = event as GenerateSkillResponse;
+        }
+      }
+    }
+
+    if (finalResult) return finalResult;
+
+    // Should never reach here, but fallback
+    throw { response: { data: { message: '生成未返回结果' } } };
+  }
+
+  // 获取 Skill 内容
+  async getSkillContent(id: string): Promise<any> {
+    const client = await this.getClient();
+    const response = await client.get(`/api/collections/${id}/skill-content`);
+    return response.data;
+  }
+
+  // 切换自动同步 Skill 开关
+  async toggleAutoSyncSkill(id: string, enabled: boolean): Promise<{ success: boolean; autoSyncSkill: boolean }> {
+    const client = await this.getClient();
+    const response = await client.post(`/api/collections/${id}/toggle-auto-sync-skill`, { enabled });
+    return response.data;
+  }
+
+  // 列出所有已生成的 Skill
+  async getSkills(): Promise<{ skills: any[] }> {
+    const client = await this.getClient();
+    const response = await client.get('/api/skills');
+    return response.data;
+  }
+
+  // 删除 Skill
+  async deleteSkill(collectionId: string): Promise<{ success: boolean }> {
+    const client = await this.getClient();
+    const response = await client.delete(`/api/skills/${collectionId}`);
+    return response.data;
+  }
+
+  // 重命名 Skill
+  async renameSkill(collectionId: string, newName: string): Promise<{ success: boolean; skillName: string; skillPath: string }> {
+    const client = await this.getClient();
+    const response = await client.put(`/api/skills/${collectionId}/rename`, { newName });
+    return response.data;
+  }
+
+  // ─── 抖音 Cookie / 扫码登录 API ───────────────────────────
+
+  // 检查 cookie 状态
+  async getCookieStatus(): Promise<{ hasCookie: boolean; hasAuth: boolean; path: string; status: string }> {
+    const client = await this.getClient();
+    const response = await client.get('/api/douyin/cookie-status');
+    return response.data;
+  }
+
+  // 应用内扫码登录
+  async startDouyinLogin(): Promise<{ qrDataUrl: string }> {
+    const client = await this.getClient();
+    return (await client.post('/api/douyin/login')).data;
+  }
+
+  async pollDouyinLogin(): Promise<{ status: 'idle' | 'waiting' | 'logged_in' | 'expired'; qrDataUrl?: string }> {
+    const client = await this.getClient();
+    return (await client.get('/api/douyin/login')).data;
+  }
+
+  async cancelDouyinLogin(): Promise<void> {
+    const client = await this.getClient();
+    await client.delete('/api/douyin/login');
+  }
+
+  // 打开浏览器扫码登录（备用）
+  async startQrLogin(): Promise<{ success: boolean; message: string; hasAuth: boolean; authInfo?: any }> {
+    const client = await this.getClient();
+    const response = await client.post('/api/douyin/qr-login');
+    return response.data;
+  }
+
+  // 手动保存 Cookie
+  async saveCookie(cookie: string): Promise<{ success: boolean; message: string; hasAuth: boolean; path: string }> {
+    const client = await this.getClient();
+    const response = await client.post('/api/douyin/save-cookie', { cookie });
+    return response.data;
+  }
+}
+
+export const apiClient = new ApiClient();

@@ -1,0 +1,284 @@
+import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Clock,
+  FileText,
+  Loader2,
+  Mic,
+  MoreHorizontal,
+  Sparkles,
+  Trash2,
+  Video,
+  XCircle,
+} from 'lucide-react';
+import { Layout } from '../components/Layout';
+import { PageHeader } from '../components/ui/PageHeader';
+import { EmptyState } from '../components/ui/EmptyState';
+import { Button } from '../components/ui/Button';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { apiClient } from '../services/api';
+import type { Job } from '../types';
+
+export function TrashPage() {
+  const navigate = useNavigate();
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Job | null>(null);
+  const [expandedMenu, setExpandedMenu] = useState<string | null>(null);
+
+  /*
+   * 提到组件作用域：错误态里的「重新加载」需要它。
+   * 原先它定义在 `useEffect` 内部，渲染层够不到，于是错误态**没有重试入口**
+   * （只能整页刷新）。
+   */
+  const load = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      setError(null);
+      const trashJobs = await apiClient.getTrashJobs();
+      setJobs(trashJobs);
+    } catch (err: any) {
+      console.error('加载垃圾桶失败:', err);
+      setError(err.response?.data?.message || '加载垃圾桶失败');
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const handleRestore = async (jobId: string) => {
+    try {
+      setBusyId(jobId);
+      await apiClient.restoreJob(jobId);
+      setJobs(jobs.filter((job) => job.id !== jobId));
+    } catch (err: any) {
+      setActionError(err.response?.data?.message || '恢复任务失败');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handlePermanentDelete = async () => {
+    if (!deleteTarget) return;
+    const job = deleteTarget;
+    try {
+      setBusyId(job.id);
+      await apiClient.permanentlyDeleteJob(job.id);
+      setJobs(jobs.filter((item) => item.id !== job.id));
+      setDeleteTarget(null);
+    } catch (err: any) {
+      setActionError(err.response?.data?.message || '永久删除任务失败');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <Layout>
+        <div className="flex items-center justify-center min-h-[420px]">
+          <div className="text-center">
+            <Loader2 className="mx-auto h-12 w-12 animate-spin text-ai" />
+            <p className="mt-4 text-ink-muted">加载垃圾桶...</p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
+
+  return (
+    <Layout>
+      <PageHeader
+        title="垃圾桶"
+        description="删除的任务会保留 30 天，可恢复或永久删除"
+        actions={
+          <Button variant="outline" onClick={() => navigate('/')}>
+            返回任务列表
+          </Button>
+        }
+      />
+
+      {/* ⚠️ 错误与空态互斥：改造前两者只按 `jobs.length === 0` 判断，
+          后端挂掉时会同时显示「加载失败」与「垃圾桶是空的」。 */}
+      {error && jobs.length > 0 && (
+        <div className="mb-6 bg-danger-soft border border-danger-line rounded-lg p-4 text-danger" role="alert">
+          {error}
+        </div>
+      )}
+
+      {jobs.length === 0 ? (
+        <div className="rounded-xl border border-line bg-panel">
+          {error ? (
+            <EmptyState
+              icon={AlertCircle}
+              title="垃圾桶加载失败"
+              description={error}
+              action={<Button variant="outline" onClick={() => void load()}>重新加载</Button>}
+            />
+          ) : (
+            <EmptyState
+              icon={Trash2}
+              title="垃圾桶是空的"
+              description="删除的任务会在这里保留 30 天，期间可以随时恢复。"
+            />
+          )}
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {jobs.map((job) => {
+            const active = job.status === 'queued' || job.status === 'processing';
+            const busy = busyId === job.id;
+
+            return (
+              <div
+                key={job.id}
+                className="bg-panel rounded-lg border border-line p-5"
+              >
+                <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+                <div className="min-w-0">
+                  <h3 className="font-medium text-ink mb-1 line-clamp-1">
+                    {job.topic || '无主题'}
+                  </h3>
+                  <p className="text-xs text-ink-muted mb-2">
+                    删除于 {formatDate(job.deletedAt)} · {formatRemaining(job.trashExpiresAt)}
+                  </p>
+                  {job.sourceUrl && (
+                    <p className="text-sm text-ink-muted line-clamp-1 break-all mb-3">
+                      {job.sourceUrl}
+                    </p>
+                  )}
+                  {/* Stage summary chips */}
+                  <div className="flex flex-wrap gap-1.5">
+                    <StageChip
+                      label="转录"
+                      done={job.steps?.transcribe?.status === 'succeeded'}
+                      failed={job.steps?.transcribe?.status === 'failed'}
+                      icon={Mic}
+                    />
+                    <StageChip
+                      label="洗稿"
+                      done={job.steps?.clean?.status === 'succeeded'}
+                      failed={job.steps?.clean?.status === 'failed'}
+                      icon={Sparkles}
+                    />
+                    <StageChip
+                      label="分镜"
+                      done={job.steps?.generate_video_prompts?.status === 'succeeded'}
+                      failed={job.steps?.generate_video_prompts?.status === 'failed'}
+                      icon={FileText}
+                    />
+                    <StageChip
+                      label="成片"
+                      done={job.steps?.generate_video?.status === 'succeeded'}
+                      failed={job.steps?.generate_video?.status === 'failed'}
+                      icon={Video}
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0 relative">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => handleRestore(job.id)}
+                    className="px-3 py-2 rounded-lg bg-accent text-on-accent text-sm hover:bg-accent-hover disabled:opacity-50 transition-all"
+                  >
+                    恢复
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/jobs/${job.id}`)}
+                    className="px-3 py-2 rounded-lg border border-line text-sm text-ink hover:bg-elevated transition-all"
+                  >
+                    查看
+                  </button>
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setExpandedMenu(expandedMenu === job.id ? null : job.id)}
+                      className="px-2 py-2 rounded-lg border border-line text-sm text-ink-muted hover:bg-elevated transition-all"
+                      aria-label="更多操作"
+                    >
+                      <MoreHorizontal size={14} />
+                    </button>
+                    {expandedMenu === job.id && (
+                      <>
+                        <div className="fixed inset-0 z-10" onClick={() => setExpandedMenu(null)} />
+                        <div className="absolute right-0 top-full mt-1 z-20 rounded-lg border border-line bg-panel shadow-lg py-1 min-w-[120px]">
+                          <button
+                            type="button"
+                            disabled={busy || active}
+                            title={active ? '处理中任务暂不能永久删除' : undefined}
+                            onClick={() => { setExpandedMenu(null); setDeleteTarget(job); }}
+                            className="flex w-full items-center gap-2 px-3 py-2 text-sm text-danger hover:bg-danger-soft disabled:opacity-50"
+                          >
+                            <Trash2 size={14} />
+                            永久删除
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="确定永久删除这个任务吗？"
+        description="相关视频、音频、转录、洗稿、提示词和成片会被清理，无法恢复。"
+        confirmLabel="永久删除"
+        tone="danger"
+        busy={busyId !== null}
+        onConfirm={handlePermanentDelete}
+        onClose={() => setDeleteTarget(null)}
+      />
+
+      {actionError && (
+        <div className="fixed bottom-6 right-6 z-50 rounded-lg border border-danger-line bg-danger-soft px-4 py-3 text-sm text-danger shadow-lg">
+          {actionError}
+          <button className="ml-3 font-medium underline" onClick={() => setActionError(null)}>
+            关闭
+          </button>
+        </div>
+      )}
+    </Layout>
+  );
+}
+
+function formatDate(value?: string) {
+  if (!value) return '未知时间';
+  return new Date(value).toLocaleString('zh-CN');
+}
+
+function formatRemaining(value?: string) {
+  if (!value) return '保留期未知';
+  const remainingMs = new Date(value).getTime() - Date.now();
+  const days = Math.ceil(remainingMs / (24 * 60 * 60 * 1000));
+  if (days <= 0) {
+    return '即将自动清理';
+  }
+  return `剩余 ${days} 天自动清理`;
+}
+
+function StageChip({ label, done, failed, icon: Icon }: { label: string; done: boolean; failed: boolean; icon: React.ComponentType<{ size?: number }> }) {
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${
+      done ? 'bg-success-soft text-success' : failed ? 'bg-danger-soft text-danger' : 'bg-elevated text-ink-muted'
+    }`}>
+      {done ? <CheckCircle2 size={10} /> : failed ? <XCircle size={10} /> : <Clock size={10} />}
+      <Icon size={10} />
+      {label}
+    </span>
+  );
+}

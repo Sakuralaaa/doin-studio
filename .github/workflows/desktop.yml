@@ -23,10 +23,12 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-noto-cjk
       - run: npm run check
-      - run: npm run build
+      - id: build
+        run: npm run build
       - name: Full source regression suite
         run: node --import tsx --test --test-concurrency=4 'src/**/*.test.ts' 'electron/**/*.test.ts' 'renderer/src/**/*.test.ts' 'renderer/src/**/*.test.tsx'
       - name: Real API browser flows and UI screenshots
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: node scripts/studio-smoke.mjs
       - uses: actions/upload-artifact@v4
         if: always()

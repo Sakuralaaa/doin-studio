@@ -1,6 +1,6 @@
 import React from 'react';
-import { Check, AlertCircle, Loader2 } from 'lucide-react';
-import type { PipelineStepStatus } from '../../types';
+import { Check, AlertCircle, Loader2, Pause } from 'lucide-react';
+import type { PipelineStep, PipelineStepStatus } from '../../types';
 
 export interface StepRailItem {
   key: string;
@@ -19,7 +19,7 @@ export interface PipelineRailProps {
   showLabels?: boolean;
 }
 
-const STEP_DEFS: { key: string; label: string }[] = [
+const STEP_DEFS: { key: PipelineStep; label: string }[] = [
   { key: 'transcribe', label: '转录' },
   { key: 'clean', label: '文稿' },
   { key: 'generate_video_prompts', label: '分镜' },
@@ -29,11 +29,12 @@ const STEP_DEFS: { key: string; label: string }[] = [
 export function PipelineRail({ steps, className = '', showLabels = false }: PipelineRailProps) {
   return (
     <div className={['flex items-center gap-1.5 w-full', className].join(' ')}>
-      {STEP_DEFS.map((def, idx) => {
-        const stepStatus = (steps as any)?.[def.key]?.status || 'pending';
+      {STEP_DEFS.map((def) => {
+        const stepStatus = steps?.[def.key]?.status || 'pending';
         const isDone = stepStatus === 'succeeded';
         const isRunning = stepStatus === 'running';
         const isFailed = stepStatus === 'failed';
+        const isPaused = stepStatus === 'paused';
 
         return (
           <div key={def.key} className="flex-1 flex flex-col gap-1">
@@ -47,6 +48,8 @@ export function PipelineRail({ steps, className = '', showLabels = false }: Pipe
                     ? 'bg-studio-info animate-pulse shadow-[0_0_8px_rgba(6,182,212,0.5)]'
                     : isFailed
                     ? 'bg-studio-danger shadow-[0_0_8px_rgba(244,63,94,0.4)]'
+                    : isPaused
+                    ? 'bg-studio-warning'
                     : 'bg-transparent',
                 ].join(' ')}
               />
@@ -61,6 +64,8 @@ export function PipelineRail({ steps, className = '', showLabels = false }: Pipe
                       ? 'text-studio-info font-medium'
                       : isFailed
                       ? 'text-studio-danger'
+                      : isPaused
+                      ? 'text-studio-warning'
                       : 'text-studio-ink-muted'
                   }
                 >
@@ -69,6 +74,7 @@ export function PipelineRail({ steps, className = '', showLabels = false }: Pipe
                 {isDone && <Check size={11} className="text-studio-success" />}
                 {isRunning && <Loader2 size={11} className="text-studio-info animate-spin" />}
                 {isFailed && <AlertCircle size={11} className="text-studio-danger" />}
+                {isPaused && <Pause size={11} className="text-studio-warning" aria-label="已暂停" />}
               </div>
             )}
           </div>

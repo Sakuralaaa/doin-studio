@@ -171,7 +171,7 @@ test("vendor 资源不存在、且 Playwright 缓存里确实有浏览器时，�
   const chromiumDir = path.join(cacheRoot, "chromium_headless_shell-1234");
   const probe = fakeProbe([], { [cacheRoot]: ["chromium_headless_shell-1234"], [chromiumDir]: ["chrome-headless-shell-mac-arm64"] });
 
-  const resolution = resolveToutiaoBrowser({ repoRoot: "/repo", probe });
+  const resolution = resolveToutiaoBrowser({ repoRoot: "/repo", platform: "darwin", env: { HOME: home }, probe });
 
   assert.deepEqual(resolution.target, { kind: "playwright" });
 });
@@ -209,6 +209,8 @@ test("系统 Chrome 只作为最后一层兜底，且必须显式允许", () => 
   const dir = path.join(cacheRoot, "chromium-1234");
   const both = resolveToutiaoBrowser({
     repoRoot: "/repo",
+    platform: "darwin",
+    env: { HOME: home },
     probe: fakeProbe([], { [cacheRoot]: ["chromium-1234"], [dir]: ["chrome-mac-arm64"] }),
     allowSystemChrome: true,
   });
@@ -327,4 +329,23 @@ test("findSystemChrome 按平台找常见位置", () => {
     findSystemChrome({ platform: "linux", probe: fakeProbe(["/usr/bin/google-chrome"]) }),
     "/usr/bin/google-chrome",
   );
+});
+
+test("浏览器缓存按传入的 Windows 和 Linux 环境解析", () => {
+  for (const platform of ["win32", "linux"] as const) {
+    const home = path.resolve("fake-browser-home");
+    const cacheRoot = platform === "win32"
+      ? path.join(home, "AppData", "Local", "ms-playwright")
+      : path.join(home, ".cache", "ms-playwright");
+    const browserDir = path.join(cacheRoot, "chromium-1234");
+    const config = {
+      platform,
+      env: platform === "win32" ? { USERPROFILE: home } : { HOME: home },
+      repoRoot: "/empty-repo",
+      probe: fakeProbe([], { [cacheRoot]: ["chromium-1234"], [browserDir]: [platform === "win32" ? "chrome-win64" : "chrome-linux"] }),
+    };
+    assert.deepEqual(resolveToutiaoBrowser(config).target, { kind: "playwright" }, platform);
+    assert.deepEqual(resolveToutiaoHeadedBrowser(config).target, { kind: "playwright" }, platform);
+    assert.equal(resolveToutiaoBrowser({ ...config, allowPlaywrightCache: false }).target, null);
+  }
 });

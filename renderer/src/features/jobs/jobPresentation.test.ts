@@ -110,8 +110,8 @@ test('buildArtifactStates resolves from availability', () => {
   assert.equal(artifacts.find((a) => a.key === 'video')?.state, 'waiting');
 });
 
-test('readStoredViewMode returns list for missing/invalid', () => {
+test('readStoredViewMode defaults to visual cards for missing/invalid preferences', () => {
   const empty = new Map<string, string>();
-  assert.equal(readStoredViewMode({ getItem: (k) => empty.get(k) ?? null } as Storage), 'list');
-  assert.equal(readStoredViewMode({ getItem: () => { throw new Error('blocked'); } } as unknown as Storage), 'list');
+  assert.equal(readStoredViewMode({ getItem: (k) => empty.get(k) ?? null } as Storage), 'card');
+  assert.equal(readStoredViewMode({ getItem: () => { throw new Error('blocked'); } } as unknown as Storage), 'card');
 });

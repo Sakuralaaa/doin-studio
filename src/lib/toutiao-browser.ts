@@ -196,7 +196,7 @@ export function resolveToutiaoBrowser(config: ToutiaoBrowserConfig = {}): Toutia
   });
 
   if (config.allowPlaywrightCache !== false) {
-    if (probePlaywrightCache(probe, env)) {
+    if (probePlaywrightCache(probe, env, platform)) {
       attempts.push({ layer: "playwright-cache", ok: true, detail: "Playwright 缓存里有可用的 chromium/headless shell" });
       return { target: { kind: "playwright" }, attempts };
     }
@@ -262,7 +262,7 @@ export function resolveToutiaoHeadedBrowser(config: ToutiaoBrowserConfig = {}): 
   }
   attempts.push({ layer: "system-chrome", ok: false, detail: "未找到系统安装的 Google Chrome" });
 
-  if (config.allowPlaywrightCache !== false && hasPlaywrightChromium(probe, env)) {
+  if (config.allowPlaywrightCache !== false && hasPlaywrightChromium(probe, env, platform)) {
     attempts.push({ layer: "playwright-cache", ok: true, detail: "Playwright 自身缓存里的 chromium" });
     return { target: { kind: "playwright" }, attempts };
   }
@@ -310,8 +310,7 @@ function playwrightCacheRoot(env: NodeJS.ProcessEnv, platform: NodeJS.Platform):
  * 只在这里看目录名，不解析 playwright 的 browsers.json（避免为了探测而引入依赖）；
  * 判断依据是「目录存在且里面有平台专属的可执行目录」。
  */
-function probePlaywrightCache(probe: ToutiaoBrowserProbe, env: NodeJS.ProcessEnv = process.env): boolean {
-  const platform = env === process.env ? process.platform : process.platform;
+function probePlaywrightCache(probe: ToutiaoBrowserProbe, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): boolean {
   const root = playwrightCacheRoot(env, platform);
   for (const name of probe.listDirectories(root)) {
     if (!/^chromium(_headless_shell)?-\d+$/u.test(name)) continue;
@@ -322,8 +321,8 @@ function probePlaywrightCache(probe: ToutiaoBrowserProbe, env: NodeJS.ProcessEnv
 }
 
 /** Playwright 缓存里是否有**完整** chromium（`chromium-<数字>`，不是 headless shell）。 */
-function hasPlaywrightChromium(probe: ToutiaoBrowserProbe, env: NodeJS.ProcessEnv = process.env): boolean {
-  const root = playwrightCacheRoot(env, process.platform);
+function hasPlaywrightChromium(probe: ToutiaoBrowserProbe, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): boolean {
+  const root = playwrightCacheRoot(env, platform);
 
   for (const name of probe.listDirectories(root)) {
     if (!/^chromium-\d+$/u.test(name)) continue;

@@ -10,12 +10,10 @@ import { Layout } from '../components/Layout';
 import { PageHeader } from '../components/ui/PageHeader';
 import { Button } from '../components/ui/Button';
 import { CreateJobDialog } from '../components/CreateJobDialog';
-import { ApiKeyWarning } from '../components/ApiKeyWarning';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { EmptyState } from '../components/ui/EmptyState';
 import { useAppStore } from '../store';
 import { apiClient } from '../services/api';
-import { hasValidApiKey } from '../utils/apiKeyValidator';
 import { useJobPolling } from '../hooks/useJobPolling';
 import type { JobFilterStatus, JobOverview, ViewMode } from '../types';
 import {
@@ -31,7 +29,6 @@ import { StudioCards as JobCardView } from '../features/jobs/StudioCards';
 
 export function JobListPage() {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const [showApiWarning, setShowApiWarning] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -272,10 +269,6 @@ export function JobListPage() {
         onClose={() => setIsDialogOpen(false)}
       />
 
-      <ApiKeyWarning
-        isOpen={showApiWarning}
-        onClose={() => setShowApiWarning(false)}
-      />
 
       <ConfirmDialog
         open={confirmDeleteId !== null}

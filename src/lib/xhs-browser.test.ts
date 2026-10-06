@@ -159,6 +159,7 @@ test("有头链跳过打包的 headless shell（它开不了窗口）", () => {
   const chromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
   const withChrome = resolveXhsHeadedBrowser({
     repoRoot: root,
+    platform: "darwin",
     env: {},
     probe: fakeProbe([chromePath], {}),
   });

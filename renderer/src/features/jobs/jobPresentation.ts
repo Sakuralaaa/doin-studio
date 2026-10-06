@@ -170,20 +170,16 @@ export const JOB_VIEW_MODE_KEY = 'douyin-ai-video.job-view-mode';
 export function readStoredViewMode(storage: Storage): ViewMode {
   try {
     const raw = storage.getItem(JOB_VIEW_MODE_KEY);
-    if (raw === 'card') return 'card';
-    return 'list';
+    if (raw === 'list') return 'list';
+    return 'card';
   } catch {
-    return 'list';
+    return 'card';
   }
 }
 
 export function writeStoredViewMode(storage: Storage, mode: ViewMode): void {
   try {
-    if (mode === 'card') {
-      storage.setItem(JOB_VIEW_MODE_KEY, 'card');
-    } else {
-      storage.removeItem(JOB_VIEW_MODE_KEY);
-    }
+    storage.setItem(JOB_VIEW_MODE_KEY, mode);
   } catch {
     // ignore quota errors
   }

@@ -86,7 +86,7 @@ output/playwright/xhs-*
 
 # Doin Studio cloud artifacts
 release/
-artifacts/
+/artifacts/
 .env.*
 !.env.example
 *.log

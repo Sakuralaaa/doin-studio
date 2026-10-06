@@ -1,0 +1,156 @@
+import React from 'react';
+import { Download, FileText, Images, Send } from 'lucide-react';
+import type { HyperframesVideoOutput } from '../../../types/index';
+
+export interface VideoArtifactProps {
+  output: HyperframesVideoOutput;
+  jobId: string;
+  title: string;
+  videoError: string | null;
+  videoUrl: string | null;
+  streamUrl: string | null;
+  streamError: boolean;
+  publishError: string;
+  onOpenPublishing: () => void;
+  /** 图文包入口：与「加入发布中心」（视频包）并列，图片可来自自动静帧或素材库。 */
+  onOpenNotePublishing: () => void;
+  /** 头条文章包入口：与图文包并列，封面必填（会自动裁成 16:9）。 */
+  onOpenToutiaoPublishing: () => void;
+  onOpenWechatPublishing?: () => void;
+  onVideoError: () => void;
+}
+
+export function VideoArtifact({
+  output,
+  videoError,
+  videoUrl,
+  streamUrl,
+  streamError,
+  publishError,
+  onOpenPublishing,
+  onOpenNotePublishing,
+  onOpenToutiaoPublishing,
+  onOpenWechatPublishing,
+  onVideoError,
+}: VideoArtifactProps) {
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h3 className="text-lg font-semibold text-ink">视频成片</h3>
+          <p className="mt-1 text-sm text-ink-muted">HyperFrames 本地渲染的 9:16 无声动效版。</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={onOpenPublishing}
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-ai px-4 py-2.5 font-medium text-on-accent transition-all hover:opacity-90"
+          >
+            <Send size={17} />
+            加入发布中心
+          </button>
+          <button
+            type="button"
+            onClick={onOpenNotePublishing}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-line bg-panel px-4 py-2.5 font-medium text-ink transition-colors hover:bg-elevated"
+          >
+            <Images size={17} />
+            创建图文包
+          </button>
+          <button
+            type="button"
+            onClick={onOpenToutiaoPublishing}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-line bg-panel px-4 py-2.5 font-medium text-ink transition-colors hover:bg-elevated"
+          >
+            <FileText size={17} />
+            创建头条文章包
+          </button>
+          {onOpenWechatPublishing ? <button type="button" onClick={onOpenWechatPublishing}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-line bg-panel px-4 py-2.5 font-medium text-ink hover:bg-elevated">
+            <FileText size={17} />创建公众号文章包
+          </button> : null}
+          {videoUrl && (
+            <a
+              href={videoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2.5 font-medium text-on-accent transition-all hover:bg-accent-hover"
+            >
+              <Download size={17} />
+              下载 MP4
+            </a>
+          )}
+        </div>
+      </div>
+
+      {publishError && (
+        <div className="rounded-lg border border-warning-line bg-warning-soft p-4 text-warning">
+          <p className="font-semibold">本机操作者未就绪</p>
+          <p className="mt-1 text-sm">{publishError}</p>
+        </div>
+      )}
+
+      {videoError && (
+        <div className="rounded-lg border border-warning-line bg-warning-soft p-4 text-warning">
+          <p className="font-semibold">本次渲染失败，正在显示上一版成片</p>
+          <p className="mt-1 text-sm">{videoError}</p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+        <Metric label="渲染器" value={output.provider} />
+        <Metric label="尺寸" value={`${output.width}x${output.height} · ${output.aspectRatio}`} />
+        <Metric label="时长" value={formatSeconds(output.duration)} />
+      </div>
+
+      {streamUrl && !streamError ? (
+        <div className="rounded-lg border border-line bg-black p-3">
+          <video
+            src={streamUrl}
+            controls
+            playsInline
+            onError={onVideoError}
+            className="mx-auto aspect-[9/16] max-h-[72vh] w-full max-w-sm rounded-md bg-black"
+          />
+        </div>
+      ) : streamError ? (
+        <div className="rounded-lg border border-warning-line bg-warning-soft p-4 text-warning">
+          <p className="font-semibold">视频预览加载失败</p>
+          <p className="mt-1 text-sm">可以先下载 MP4 到本地查看。</p>
+        </div>
+      ) : null}
+
+      <details className="rounded-lg border border-line bg-panel">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-ink-muted hover:text-ink">
+          高级信息
+        </summary>
+        <div className="px-4 pb-4 space-y-3">
+          <div className="rounded-lg bg-elevated p-4">
+            <label className="mb-2 block text-xs font-medium uppercase text-ink-muted">视频文件</label>
+            <p className="break-all font-mono text-xs text-ink">{output.videoPath}</p>
+          </div>
+          <div className="rounded-lg bg-elevated p-4">
+            <label className="mb-2 block text-xs font-medium uppercase text-ink-muted">HyperFrames 项目</label>
+            <p className="break-all font-mono text-xs text-ink">{output.projectPath}</p>
+          </div>
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-elevated px-4 py-3">
+      <label className="mb-1 block text-xs text-ink-muted">{label}</label>
+      <p className="text-sm text-ink">{value}</p>
+    </div>
+  );
+}
+
+function formatSeconds(seconds: number) {
+  const safe = Math.max(0, Math.round(seconds));
+  const m = Math.floor(safe / 60);
+  const s = safe % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}

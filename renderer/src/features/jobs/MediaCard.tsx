@@ -36,6 +36,7 @@ export function MediaCard({ job, onOpen, onDelete, deleting = false }: MediaCard
             src={job.preview.coverUrl}
             alt={job.preview.displayTitle}
             loading="lazy"
+            referrerPolicy="no-referrer"
             onError={() => setImageFailed(true)}
             className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
           />
@@ -53,7 +54,7 @@ export function MediaCard({ job, onOpen, onDelete, deleting = false }: MediaCard
           >
             {isDone ? '已就绪' : isRunning ? '运行中' : isFailed ? '异常' : '待处理'}
           </StudioBadge>
-          <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-black/60 backdrop-blur-md text-white/90 border border-white/10">
+          <span className="text-xs font-mono px-2 py-0.5 rounded-md bg-black/60 backdrop-blur-md text-white/90 border border-white/10">
             {job.preview?.sourcePlatform || 'DOUYIN'}
           </span>
         </div>

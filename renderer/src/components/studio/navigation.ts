@@ -62,5 +62,5 @@ export function getPageContext(pathname: string): { title: string; subtitle: str
   if (pathname === '/skills') return { category: '知识资产', title: 'AI 技能资产库', subtitle: '提示词蒸馏与专属定制技能' };
   if (pathname === '/trash') return { category: '系统', title: '作品回收站', subtitle: '30 天内可恢复的归档项目' };
   if (pathname === '/settings') return { category: '配置与诊断', title: '系统设置与环境就绪度', subtitle: 'AI 密钥 · Playwright · FFmpeg · Whisper · Sau 引擎' };
-  return { category: '创作中心', title: '抖创工坊 · 创作者专业工作台', subtitle: '高效从短视频提炼灵感、重构剧本、生成分镜与多端交付' };
+  return { category: '创作中心', title: 'Doin Studio · 创作工作台', subtitle: '从短视频提炼灵感、整理文案、生成分镜与多端交付' };
 }

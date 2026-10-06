@@ -52,7 +52,7 @@ export function PipelineRail({ steps, className = '', showLabels = false }: Pipe
               />
             </div>
             {showLabels && (
-              <div className="flex items-center justify-between text-[11px] font-mono">
+              <div className="flex items-center justify-between text-xs">
                 <span
                   className={
                     isDone

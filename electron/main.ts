@@ -81,12 +81,6 @@ async function createWindow() {
     mainWindow?.focus();
     console.log('[Main] Window should be visible now');
 
-    // 发送系统通知确认
-    const { Notification } = require('electron');
-    new Notification({
-      title: '抖创工坊',
-      body: 'Electron 应用已启动！',
-    }).show();
   });
 
   // 超时后强制显示窗口（调试用）

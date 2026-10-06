@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import { Film, Video, RotateCcw, Download } from 'lucide-react';
 
 export function StudioMonitor({ rawUrl, finalUrl, downloadUrl }: { rawUrl: string | null; finalUrl: string | null; downloadUrl: string | null }) {

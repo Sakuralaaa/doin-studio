@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import express from 'express';
@@ -18,8 +18,12 @@ for (const source of HOTSPOT_SOURCES) {
   await writeFile(path.join(storage, 'cache', 'hotspots', `${source.id}.json`), JSON.stringify({ items, fetchedAt: now, checkedAt: now }));
 }
 const app = await createExpressApp({ rootDir: root, storagePath: storage });
-app.use(express.static(path.join(root, 'dist-renderer')));
-app.get('*', (_req, res) => res.sendFile(path.join(root, 'dist-renderer', 'index.html')));
+// The desktop build uses relative assets for file://. When hosting that same
+// build over HTTP, anchor assets at the web root so deep-link refreshes work.
+const webHTML = (await readFile(path.join(root, 'dist-renderer', 'index.html'), 'utf8'))
+  .replace('<head>', '<head><base href="/">');
+app.use(express.static(path.join(root, 'dist-renderer'), { index: false }));
+app.get('*', (_req, res) => res.type('html').send(webHTML));
 const server = await new Promise(resolve => { const handle = app.listen(5173, () => resolve(handle)); });
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -108,6 +112,11 @@ try {
   assert.deepEqual(errors, [], 'Unhandled browser errors');
   await writeFile(path.join(root, 'artifacts', 'browser-report.json'), JSON.stringify({ passed: true, checks, sizes, routes, externalAI: 'not called', platformPublishing: 'not called' }, null, 2));
   console.log(JSON.stringify({ passed: true, checks, screenshots: 'artifacts/screenshots' }));
+} catch (error) {
+  await page.screenshot({ path: path.join(evidence, 'failure.png'), fullPage: true }).catch(() => {});
+  await writeFile(path.join(root, 'artifacts', 'failure.html'), await page.content()).catch(() => {});
+  await writeFile(path.join(root, 'artifacts', 'browser-report.json'), JSON.stringify({ passed: false, checks, url: page.url(), errors, error: String(error) }, null, 2));
+  throw error;
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));

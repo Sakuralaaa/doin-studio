@@ -59,7 +59,11 @@ jobs:
         if: always()
         with:
           name: doin-studio-windows-${{ github.sha }}
-          path: |
-            release/*.exe
-            artifacts/windows/
+          path: release/*.exe
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-windows-evidence-${{ github.sha }}
+          path: artifacts/windows/
           retention-days: 14

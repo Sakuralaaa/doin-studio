@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import React, { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { Link, NavLink, useLocation } from 'react-router-dom';
 import { Radio, PanelLeftClose, PanelLeftOpen, MoreHorizontal } from 'lucide-react';
 import { MAIN_NAV_ITEMS, ASSET_NAV_ITEMS, BOTTOM_NAV_ITEMS, getPageContext, isItemActive, type NavItemDef } from './navigation';

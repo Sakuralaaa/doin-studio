@@ -54,12 +54,16 @@ jobs:
         run: node scripts/studio-electron-smoke.mjs
       - name: Installer checksums
         shell: pwsh
-        run: Get-ChildItem release/*.exe | Get-FileHash -Algorithm SHA256 | Format-List | Out-File artifacts/windows/SHA256.txt
+        run: |
+          Get-ChildItem release/*.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content -Encoding ascii release/SHA256.txt
+          Copy-Item -LiteralPath release/SHA256.txt -Destination artifacts/windows/SHA256.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: doin-studio-windows-${{ github.sha }}
-          path: release/*.exe
+          path: |
+            release/*.exe
+            release/SHA256.txt
           retention-days: 14
       - uses: actions/upload-artifact@v4
         if: always()

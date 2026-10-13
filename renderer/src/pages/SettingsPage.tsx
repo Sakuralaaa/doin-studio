@@ -481,7 +481,7 @@ function ModelsSection({
         <div className="rounded-lg border border-dashed border-line bg-panel py-16 text-center">
           <KeyRound className="mx-auto mb-4 h-11 w-11 text-ai" />
           <h3 className="text-lg font-semibold text-ink">还没有 API 密钥</h3>
-          <p className="mt-2 text-ink-muted">添加第一个密钥后即可创建视频作品。</p>
+              <p className="mt-2 text-ink-muted">添加密钥后即可使用 AI 文案与分镜；导入和本地转录可先使用。</p>
           <button
             onClick={onStartAdd}
             className="mt-6 inline-flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 font-medium text-on-accent transition-all hover:bg-accent-hover"

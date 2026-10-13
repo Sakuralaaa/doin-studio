@@ -47,14 +47,14 @@ export function ArtifactNavigator({ active, items, onChange }: ArtifactNavigator
             tabIndex={roving.tabIndexFor(item.key)}
             ref={(node) => { roving.refs.current[item.key] = node; }}
             onClick={() => onChange(item.key)}
-            className={`mr-1 flex min-w-[130px] items-center justify-between gap-2 rounded-t-lg px-4 py-3 text-left text-sm font-semibold transition-all ${
+            className={`mr-1 flex min-w-[140px] shrink-0 items-center justify-between gap-2 whitespace-nowrap rounded-t-lg px-4 py-3 text-left text-sm font-semibold transition-all ${
               isActive
                 ? 'bg-panel text-ink shadow-sm'
                 : 'text-ink-muted hover:bg-panel/60'
             }`}
           >
             <span>{item.label}</span>
-            <span className={`rounded-full px-1.5 py-0.5 text-[11px] font-medium ${stateClasses[item.state]}`}>
+            <span className={`rounded-full px-1.5 py-0.5 text-xs font-medium ${stateClasses[item.state]}`}>
               {stateLabels[item.state]}
             </span>
           </button>

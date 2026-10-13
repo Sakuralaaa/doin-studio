@@ -31,6 +31,7 @@ const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 const base = 'http://localhost:5173';
 const checks = [];
+const layouts = [];
 const sizes = [{ name: 'desktop', width: 1440, height: 1000 }, { name: 'tablet', width: 1024, height: 768 }, { name: 'mobile', width: 390, height: 844 }, { name: 'narrow', width: 360, height: 800 }];
 async function snapshot(name, route, size) {
   await page.setViewportSize(size);
@@ -39,7 +40,18 @@ async function snapshot(name, route, size) {
   await page.waitForTimeout(350);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2);
   assert.equal(overflow, false, `${name} overflows at ${size.width}px`);
-  await page.screenshot({ path: path.join(evidence, `${size.name}-${name}.png`), fullPage: true });
+  const layout = await page.evaluate(() => {
+    const main = document.querySelector('.studio-content').getBoundingClientRect();
+    const heading = document.querySelector('h1').getBoundingClientRect();
+    const header = document.querySelector('.studio-header').getBoundingClientRect();
+    return { mainLeft: main.left, mainWidth: main.width, headingLeft: heading.left, headerLeft: header.left, scrollX, scrollY };
+  });
+  layouts.push({ name, size: size.name, ...layout });
+  await writeFile(path.join(root, 'artifacts', 'layout-report.json'), JSON.stringify(layouts, null, 2));
+  assert.equal(layout.scrollX, 0, `${name}: the whole page shifted horizontally`);
+  assert.ok(layout.mainLeft >= (size.width >= 768 ? 219 : 0), `${name}: content is covered by the navigation`);
+  assert.ok(layout.headingLeft >= layout.mainLeft, `${name}: heading is outside the content`);
+  await page.screenshot({ path: path.join(evidence, `${size.name}-${name}.png`), fullPage: true, animations: 'disabled' });
 }
 async function createFromUI(title, videoID) {
   await page.goto(base);
@@ -102,6 +114,7 @@ try {
   await page.getByRole('button', { name: '更多', exact: true }).click();
   await page.getByRole('dialog').getByRole('link', { name: '设置与环境' }).click();
   await page.waitForURL(/\/settings/);
+  await page.getByRole('dialog').waitFor({ state: 'hidden' });
   assert.equal(await page.getByRole('dialog').count(), 0);
   await page.getByLabel('界面主题').selectOption('light');
   await page.waitForFunction(() => document.documentElement.dataset.theme === 'light');

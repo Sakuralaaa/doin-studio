@@ -264,8 +264,9 @@
 
 .studio-rail { width: var(--studio-rail); transition: width 160ms ease; }
 @media (min-width: 768px) {
+  .studio-shell { display: grid; grid-template-columns: var(--studio-rail) minmax(0, 1fr); }
   .studio-header { left: var(--studio-rail); transition: left 160ms ease; }
-  .studio-content { margin-left: var(--studio-rail); transition: margin-left 160ms ease; }
+  .studio-content { grid-column: 2; }
 }
 .studio-shell .rounded-lg { border-radius: 12px; }
 .studio-shell .font-display { font-family: var(--font-sans); }

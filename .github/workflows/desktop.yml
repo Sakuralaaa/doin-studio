@@ -58,7 +58,7 @@ jobs:
           Get-ChildItem release/*.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content -Encoding ascii release/SHA256.txt
           Copy-Item -LiteralPath release/SHA256.txt -Destination artifacts/windows/SHA256.txt
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: doin-studio-windows-${{ github.sha }}
           path: |
